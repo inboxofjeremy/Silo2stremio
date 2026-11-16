@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.1"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.2"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -226,7 +226,6 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
     const titleMatches = candidates.filter((item) => {
       const itemNorm = normalizeTitle(item.Name);
-      // Flexible matching to accommodate regional suffixes like (CA)
       const titleOk =
         itemNorm === targetNorm ||
         itemNorm.startsWith(`${targetNorm} `) ||
@@ -247,21 +246,26 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   return { matches: [], session: activeSession, method: 'None' };
 }
 
-async function getSeriesEpisodes(cfg, seriesId) {
+async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode) {
   const session = await getValidSession(cfg, false);
   try {
     const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
       UserId: session.userId,
+      Season: targetSeason,
       Fields: 'ProviderIds,MediaSources,Path',
     });
-    return { episodes: res.data?.Items || [], session: res.session };
+    const episodes = res.data?.Items || [];
+    const matched = episodes.filter((ep) => Number(ep.IndexNumber) === Number(targetEpisode));
+    return { episodes: matched, session: res.session };
   } catch {
     const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
       ParentId: seriesId,
       Recursive: true,
       IncludeItemTypes: 'Episode',
+      ParentIndexNumber: targetSeason,
+      IndexNumber: targetEpisode,
       Fields: 'ProviderIds,MediaSources,Path',
-      Limit: 1000,
+      Limit: 5,
     });
     return { episodes: res.data?.Items || [], session: res.session };
   }
@@ -273,7 +277,7 @@ function formatBytes(bytes) {
   return gb >= 1 ? `${gb.toFixed(2)} GB` : `${(Number(bytes) / (1024 ** 2)).toFixed(0)} MB`;
 }
 
-function buildStreamCards(item, serverUrl, accessToken) {
+function buildStreamCards(item, serverUrl, accessToken, resolvedTitle = '') {
   const sources =
     Array.isArray(item.MediaSources) && item.MediaSources.length > 0
       ? item.MediaSources
@@ -295,8 +299,8 @@ function buildStreamCards(item, serverUrl, accessToken) {
     const channels = audio.Channels ? `${audio.Channels}ch` : '';
     const sizeStr = formatBytes(source.Size);
 
-    const details = [videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
-    const fileName = source.Name || item.Name || 'Direct Stream';
+    const details = [resLabel, videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
+    const displayName = item.Name || resolvedTitle || 'Direct Stream';
 
     const subtitles = streams
       .filter((s) => s.Type === 'Subtitle' && s.IsExternal)
@@ -310,8 +314,8 @@ function buildStreamCards(item, serverUrl, accessToken) {
     const streamUrl = `${serverUrl}/Videos/${item.Id}/stream${containerExt}?static=true&MediaSourceId=${source.Id}&api_key=${accessToken}`;
 
     return {
-      name: `Silo\n${resLabel}`,
-      title: `${fileName}${details ? `\n${details}` : ''}`,
+      name: 'Silo',
+      title: `${displayName}\n${details}`,
       url: streamUrl,
       ...(subtitles.length > 0 ? { subtitles } : {}),
       behaviorHints: {
@@ -325,7 +329,7 @@ function buildStreamCards(item, serverUrl, accessToken) {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.1',
+    version: '1.3.2',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -436,14 +440,9 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
       matches = foundItems;
     } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
       for (const series of foundItems) {
-        const epRes = await getSeriesEpisodes(cfg, series.Id);
+        const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode);
         activeSession = epRes.session;
-        const epMatches = epRes.episodes.filter(
-          (ep) =>
-            Number(ep.ParentIndexNumber) === parsed.season &&
-            Number(ep.IndexNumber) === parsed.episode
-        );
-        matches.push(...epMatches);
+        matches.push(...epRes.episodes);
       }
     }
 
@@ -452,7 +451,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     );
 
     const streams = matches.flatMap((item) =>
-      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken)
+      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, item.Name)
     );
 
     return res.json({ streams });

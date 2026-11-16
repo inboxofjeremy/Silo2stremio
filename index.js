@@ -14,7 +14,7 @@ const libraryCache = new Map(); // key = `${serverUrl}::${userId}` -> { timestam
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.0.0"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.1.0"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -56,9 +56,12 @@ async function authenticateSilo(serverUrl, username, password) {
 }
 
 async function getValidSession(cfg, forceRefresh = false) {
-  // Support legacy tokens if someone still uses an old manifest URL
   if (cfg.userId && cfg.accessToken && !cfg.username) {
-    return { serverUrl: cfg.serverUrl.replace(/\/+$/, ''), userId: cfg.userId, accessToken: cfg.accessToken };
+    return {
+      serverUrl: cfg.serverUrl.replace(/\/+$/, ''),
+      userId: cfg.userId,
+      accessToken: cfg.accessToken,
+    };
   }
 
   const baseUrl = cfg.serverUrl.replace(/\/+$/, '');
@@ -99,7 +102,6 @@ async function getSiloLibrary(cfg) {
   try {
     res = await fetchItemsFromSilo(session);
   } catch (err) {
-    // If Silo expired the token (401/403), force a fresh login and retry once
     if (err.response && (err.response.status === 401 || err.response.status === 403) && cfg.username) {
       console.log('[SiloBridge] Token expired, re-authenticating...');
       session = await getValidSession(cfg, true);
@@ -157,9 +159,10 @@ function formatBytes(bytes) {
 }
 
 function buildStreamCards(item, serverUrl, accessToken) {
-  const sources = Array.isArray(item.MediaSources) && item.MediaSources.length > 0
-    ? item.MediaSources
-    : [{ Id: item.Id, Container: 'mp4', MediaStreams: [] }];
+  const sources =
+    Array.isArray(item.MediaSources) && item.MediaSources.length > 0
+      ? item.MediaSources
+      : [{ Id: item.Id, Container: 'mp4', MediaStreams: [] }];
 
   return sources.map((source) => {
     const streams = source.MediaStreams || [];
@@ -207,7 +210,7 @@ function buildStreamCards(item, serverUrl, accessToken) {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.1.0',
+    version: '1.1.1',
     name: 'Silo Server',
     description: 'Direct-play stream resolver for Silo Server (auto-refreshing session)',
     resources: ['stream'],
@@ -244,7 +247,6 @@ app.post('/api/auth', async (req, res) => {
   try {
     const baseUrl = serverUrl.replace(/\/+$/, '');
     const session = await authenticateSilo(baseUrl, username, password || '');
-    // Store credentials so the bridge can auto-refresh expired tokens on demand
     const tokenConfig = encodeConfig({
       serverUrl: baseUrl,
       username,
@@ -263,6 +265,29 @@ app.post('/api/auth', async (req, res) => {
       err.message ||
       'Failed to connect to Silo Server.';
     return res.status(status).json({ error: msg });
+  }
+});
+
+app.get('/:config/debug', async (req, res) => {
+  const cfg = decodeConfig(req.params.config);
+  if (!cfg) return res.status(400).json({ error: 'Invalid config' });
+
+  try {
+    const { items } = await getSiloLibrary(cfg);
+    const summary = items.map((i) => ({
+      Id: i.Id,
+      Name: i.Name,
+      Type: i.Type,
+      SeriesName: i.SeriesName,
+      SeriesId: i.SeriesId,
+      Season: i.ParentIndexNumber,
+      Episode: i.IndexNumber,
+      ProviderIds: i.ProviderIds || {},
+      HasMediaSources: Array.isArray(i.MediaSources) && i.MediaSources.length > 0,
+    }));
+    return res.json({ count: items.length, items: summary });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, details: err.response?.data });
   }
 });
 
@@ -305,7 +330,9 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
       );
     }
 
-    console.log(`[SiloBridge] Lookup ${type} ${id} -> ${matches.length} match(es) out of ${items.length} library items`);
+    console.log(
+      `[SiloBridge] Lookup ${type} ${id} -> ${matches.length} match(es) out of ${items.length} library items`
+    );
 
     const streams = matches.flatMap((item) =>
       buildStreamCards(item, session.serverUrl, session.accessToken)
@@ -428,7 +455,7 @@ app.get(['/configure', '/:config/configure'], (_req, res) => {
 
     function installStremio() {
       if (!generatedUrl) return;
-      window.location.href = generatedUrl.replace(/^https?:\/\//, 'stremio://');
+      window.location.href = generatedUrl.replace('https://', 'stremio://').replace('http://', 'stremio://');
     }
   </script>
 </body>

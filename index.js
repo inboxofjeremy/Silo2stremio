@@ -11,10 +11,11 @@ app.use(express.json());
 // In-memory caches
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
 const libraryCache = new Map(); // key = `${serverUrl}::${userId}` -> { timestamp, items }
+const episodesCache = new Map(); // key = `${serverUrl}::${seriesId}` -> { timestamp, items }
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.1.0"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.2.0"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -74,23 +75,38 @@ async function getValidSession(cfg, forceRefresh = false) {
   return authenticateSilo(baseUrl, cfg.username, cfg.password);
 }
 
-async function fetchItemsFromSilo(session) {
-  return axios.get(`${session.serverUrl}/Users/${session.userId}/Items`, {
-    params: {
-      Recursive: true,
-      IncludeItemTypes: 'Movie,Series,Episode',
-      Fields: 'ProviderIds,MediaSources,Path',
-    },
-    headers: {
-      'X-Emby-Token': session.accessToken,
-      'X-Emby-Authorization': EMY_AUTH_HEADER,
-    },
-    timeout: 20000,
-  });
+async function siloGet(cfg, path, params = {}) {
+  let session = await getValidSession(cfg, false);
+  try {
+    const res = await axios.get(`${session.serverUrl}${path}`, {
+      params,
+      headers: {
+        'X-Emby-Token': session.accessToken,
+        'X-Emby-Authorization': EMY_AUTH_HEADER,
+      },
+      timeout: 20000,
+    });
+    return { data: res.data, session };
+  } catch (err) {
+    if (err.response && (err.response.status === 401 || err.response.status === 403) && cfg.username) {
+      console.log('[SiloBridge] Token expired, re-authenticating...');
+      session = await getValidSession(cfg, true);
+      const retry = await axios.get(`${session.serverUrl}${path}`, {
+        params,
+        headers: {
+          'X-Emby-Token': session.accessToken,
+          'X-Emby-Authorization': EMY_AUTH_HEADER,
+        },
+        timeout: 20000,
+      });
+      return { data: retry.data, session };
+    }
+    throw err;
+  }
 }
 
 async function getSiloLibrary(cfg) {
-  let session = await getValidSession(cfg, false);
+  const session = await getValidSession(cfg, false);
   const cacheKey = `${session.serverUrl}::${session.userId}`;
   const cached = libraryCache.get(cacheKey);
 
@@ -98,22 +114,55 @@ async function getSiloLibrary(cfg) {
     return { items: cached.items, session };
   }
 
-  let res;
-  try {
-    res = await fetchItemsFromSilo(session);
-  } catch (err) {
-    if (err.response && (err.response.status === 401 || err.response.status === 403) && cfg.username) {
-      console.log('[SiloBridge] Token expired, re-authenticating...');
-      session = await getValidSession(cfg, true);
-      res = await fetchItemsFromSilo(session);
-    } else {
-      throw err;
+  const { data, session: activeSession } = await siloGet(
+    cfg,
+    `/Users/${session.userId}/Items`,
+    {
+      Recursive: true,
+      IncludeItemTypes: 'Movie,Series',
+      Fields: 'ProviderIds,MediaSources,Path',
     }
+  );
+
+  const items = data?.Items || [];
+  libraryCache.set(cacheKey, { timestamp: Date.now(), items });
+  return { items, session: activeSession };
+}
+
+async function getSeriesEpisodes(cfg, seriesId) {
+  const session = await getValidSession(cfg, false);
+  const cacheKey = `${session.serverUrl}::${seriesId}`;
+  const cached = episodesCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return { episodes: cached.items, session };
   }
 
-  const items = res.data?.Items || [];
-  libraryCache.set(cacheKey, { timestamp: Date.now(), items });
-  return { items, session };
+  // Try standard Jellyfin /Shows/{seriesId}/Episodes endpoint first
+  let data;
+  let activeSession = session;
+  try {
+    const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
+      UserId: session.userId,
+      Fields: 'ProviderIds,MediaSources,Path',
+    });
+    data = res.data;
+    activeSession = res.session;
+  } catch {
+    // Fallback to ParentId query on /Users/{userId}/Items
+    const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+      ParentId: seriesId,
+      Recursive: true,
+      IncludeItemTypes: 'Episode',
+      Fields: 'ProviderIds,MediaSources,Path',
+    });
+    data = res.data;
+    activeSession = res.session;
+  }
+
+  const episodes = data?.Items || [];
+  episodesCache.set(cacheKey, { timestamp: Date.now(), items: episodes });
+  return { episodes, session: activeSession };
 }
 
 function parseStremioId(rawId) {
@@ -210,9 +259,9 @@ function buildStreamCards(item, serverUrl, accessToken) {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.1.1',
+    version: '1.2.0',
     name: 'Silo Server',
-    description: 'Direct-play stream resolver for Silo Server (auto-refreshing session)',
+    description: 'Direct-play stream resolver for Silo Server (Movies & Series)',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'tmdb:', 'tvdb:', 'anidb:'],
@@ -278,10 +327,6 @@ app.get('/:config/debug', async (req, res) => {
       Id: i.Id,
       Name: i.Name,
       Type: i.Type,
-      SeriesName: i.SeriesName,
-      SeriesId: i.SeriesId,
-      Season: i.ParentIndexNumber,
-      Episode: i.IndexNumber,
       ProviderIds: i.ProviderIds || {},
       HasMediaSources: Array.isArray(i.MediaSources) && i.MediaSources.length > 0,
     }));
@@ -307,27 +352,27 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
   try {
     const { items, session } = await getSiloLibrary(cfg);
     let matches = [];
+    let activeSession = session;
 
     if (type === 'movie') {
       matches = items.filter(
         (item) => item.Type === 'Movie' && matchProviderId(item, parsed.provider, parsed.id)
       );
     } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
-      const seriesIds = new Set(
-        items
-          .filter(
-            (item) => item.Type === 'Series' && matchProviderId(item, parsed.provider, parsed.id)
-          )
-          .map((s) => s.Id)
+      const matchingSeries = items.filter(
+        (item) => item.Type === 'Series' && matchProviderId(item, parsed.provider, parsed.id)
       );
 
-      matches = items.filter(
-        (item) =>
-          item.Type === 'Episode' &&
-          seriesIds.has(item.SeriesId) &&
-          Number(item.ParentIndexNumber) === parsed.season &&
-          Number(item.IndexNumber) === parsed.episode
-      );
+      for (const series of matchingSeries) {
+        const epRes = await getSeriesEpisodes(cfg, series.Id);
+        activeSession = epRes.session;
+        const epMatches = epRes.episodes.filter(
+          (ep) =>
+            Number(ep.ParentIndexNumber) === parsed.season &&
+            Number(ep.IndexNumber) === parsed.episode
+        );
+        matches.push(...epMatches);
+      }
     }
 
     console.log(
@@ -335,7 +380,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     );
 
     const streams = matches.flatMap((item) =>
-      buildStreamCards(item, session.serverUrl, session.accessToken)
+      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken)
     );
 
     return res.json({ streams });

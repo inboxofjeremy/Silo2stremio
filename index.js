@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.4"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.5"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -268,12 +268,13 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode) {
     }
   }
 
-  // 1. Try requested season first (e.g. Season 24)
+  // 1. STRICTLY try the exact season requested by Stremio first
   let result = await querySeason(targetSeason);
-  if (result.episodes.length > 0) return result;
+  if (result.episodes.length > 0) {
+    return result;
+  }
 
-  // 2. Fallback: If season mismatch occurs (e.g. TVDB/broadcast year vs TMDb index like Pawn Stars 2026),
-  // cycle through recent broadcast years automatically
+  // 2. Only if the exact season returned nothing, check for broadcast year mismatches
   const currentYear = new Date().getFullYear();
   const possibleYears = [currentYear, currentYear - 1, currentYear - 2, 2026, 2025, 2024];
 
@@ -320,7 +321,6 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 
     const details = [resLabel, videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
     
-    // Use series name as the clean display title
     const displayName = seriesTitle || item.Name || 'Direct Stream';
     const episodeTitle = seriesTitle && item.Name && item.Name !== seriesTitle ? ` — ${item.Name}` : '';
 
@@ -351,7 +351,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.4',
+    version: '1.3.5',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],

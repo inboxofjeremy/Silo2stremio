@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.3"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.4"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -243,27 +243,51 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
 async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode) {
   const session = await getValidSession(cfg, false);
-  try {
-    const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
-      UserId: session.userId,
-      Season: targetSeason,
-      Fields: 'ProviderIds,MediaSources,Path',
-    });
-    const episodes = res.data?.Items || [];
-    const matched = episodes.filter((ep) => Number(ep.IndexNumber) === Number(targetEpisode));
-    return { episodes: matched, session: res.session };
-  } catch {
-    const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
-      ParentId: seriesId,
-      Recursive: true,
-      IncludeItemTypes: 'Episode',
-      ParentIndexNumber: targetSeason,
-      IndexNumber: targetEpisode,
-      Fields: 'ProviderIds,MediaSources,Path',
-      Limit: 5,
-    });
-    return { episodes: res.data?.Items || [], session: res.session };
+
+  async function querySeason(seasonNum) {
+    try {
+      const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
+        UserId: session.userId,
+        Season: seasonNum,
+        Fields: 'ProviderIds,MediaSources,Path',
+      });
+      const episodes = res.data?.Items || [];
+      const matched = episodes.filter((ep) => Number(ep.IndexNumber) === Number(targetEpisode));
+      return { episodes: matched, session: res.session };
+    } catch {
+      const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+        ParentId: seriesId,
+        Recursive: true,
+        IncludeItemTypes: 'Episode',
+        ParentIndexNumber: seasonNum,
+        IndexNumber: targetEpisode,
+        Fields: 'ProviderIds,MediaSources,Path',
+        Limit: 5,
+      });
+      return { episodes: res.data?.Items || [], session: res.session };
+    }
   }
+
+  // 1. Try requested season first (e.g. Season 24)
+  let result = await querySeason(targetSeason);
+  if (result.episodes.length > 0) return result;
+
+  // 2. Fallback: If season mismatch occurs (e.g. TVDB/broadcast year vs TMDb index like Pawn Stars 2026),
+  // cycle through recent broadcast years automatically
+  const currentYear = new Date().getFullYear();
+  const possibleYears = [currentYear, currentYear - 1, currentYear - 2, 2026, 2025, 2024];
+
+  if (!possibleYears.includes(targetSeason)) {
+    for (const yearSeason of possibleYears) {
+      result = await querySeason(yearSeason);
+      if (result.episodes.length > 0) {
+        console.log(`[SiloBridge] Season fallback: mapped season ${targetSeason} -> ${yearSeason}`);
+        return result;
+      }
+    }
+  }
+
+  return { episodes: [], session };
 }
 
 function formatBytes(bytes) {
@@ -272,7 +296,7 @@ function formatBytes(bytes) {
   return gb >= 1 ? `${gb.toFixed(2)} GB` : `${(Number(bytes) / (1024 ** 2)).toFixed(0)} MB`;
 }
 
-function buildStreamCards(item, serverUrl, accessToken, resolvedTitle = '') {
+function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
   const sources =
     Array.isArray(item.MediaSources) && item.MediaSources.length > 0
       ? item.MediaSources
@@ -295,7 +319,10 @@ function buildStreamCards(item, serverUrl, accessToken, resolvedTitle = '') {
     const sizeStr = formatBytes(source.Size);
 
     const details = [resLabel, videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
-    const displayName = item.Name || resolvedTitle || 'Direct Stream';
+    
+    // Use series name as the clean display title
+    const displayName = seriesTitle || item.Name || 'Direct Stream';
+    const episodeTitle = seriesTitle && item.Name && item.Name !== seriesTitle ? ` — ${item.Name}` : '';
 
     const subtitles = streams
       .filter((s) => s.Type === 'Subtitle' && s.IsExternal)
@@ -310,7 +337,7 @@ function buildStreamCards(item, serverUrl, accessToken, resolvedTitle = '') {
 
     return {
       name: 'Silo',
-      title: `${displayName}\n${details}`,
+      title: `${displayName}${episodeTitle}\n${details}`,
       url: streamUrl,
       ...(subtitles.length > 0 ? { subtitles } : {}),
       behaviorHints: {
@@ -324,7 +351,7 @@ function buildStreamCards(item, serverUrl, accessToken, resolvedTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.3',
+    version: '1.3.4',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -446,7 +473,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     );
 
     const streams = matches.flatMap((item) =>
-      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, item.Name)
+      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, foundItems[0]?.Name)
     );
 
     return res.json({ streams });

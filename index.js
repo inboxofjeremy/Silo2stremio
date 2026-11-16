@@ -8,14 +8,14 @@ const PORT = process.env.PORT || 7000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory library cache: key = `${serverUrl}::${userId}`
-const libraryCache = new Map();
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// In-memory caches
+const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
+const libraryCache = new Map(); // key = `${serverUrl}::${userId}` -> { timestamp, items }
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const EMY_AUTH_HEADER =
   'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.0.0"';
 
-// --- Config Encoding / Decoding ---
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
@@ -29,12 +29,11 @@ function decodeConfig(encoded) {
   }
 }
 
-// --- Silo API Helpers ---
 async function authenticateSilo(serverUrl, username, password) {
   const baseUrl = serverUrl.replace(/\/+$/, '');
   const res = await axios.post(
     `${baseUrl}/Users/AuthenticateByName`,
-    { Username: username, Pw: password },
+    { Username: username, Pw: password || '' },
     {
       headers: {
         'Content-Type': 'application/json',
@@ -51,38 +50,73 @@ async function authenticateSilo(serverUrl, username, password) {
     throw new Error('Authentication succeeded but UserId or AccessToken was missing.');
   }
 
-  return { serverUrl: baseUrl, userId, accessToken };
+  const session = { serverUrl: baseUrl, userId, accessToken };
+  sessionCache.set(`${baseUrl}::${username}`, session);
+  return session;
 }
 
-async function getSiloLibrary(serverUrl, userId, accessToken) {
-  const cacheKey = `${serverUrl}::${userId}`;
-  const cached = libraryCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return cached.items;
+async function getValidSession(cfg, forceRefresh = false) {
+  // Support legacy tokens if someone still uses an old manifest URL
+  if (cfg.userId && cfg.accessToken && !cfg.username) {
+    return { serverUrl: cfg.serverUrl.replace(/\/+$/, ''), userId: cfg.userId, accessToken: cfg.accessToken };
   }
 
-  const res = await axios.get(`${serverUrl}/Users/${userId}/Items`, {
+  const baseUrl = cfg.serverUrl.replace(/\/+$/, '');
+  const key = `${baseUrl}::${cfg.username}`;
+
+  if (!forceRefresh && sessionCache.has(key)) {
+    return sessionCache.get(key);
+  }
+
+  return authenticateSilo(baseUrl, cfg.username, cfg.password);
+}
+
+async function fetchItemsFromSilo(session) {
+  return axios.get(`${session.serverUrl}/Users/${session.userId}/Items`, {
     params: {
       Recursive: true,
       IncludeItemTypes: 'Movie,Series,Episode',
       Fields: 'ProviderIds,MediaSources,Path',
     },
     headers: {
-      'X-Emby-Token': accessToken,
+      'X-Emby-Token': session.accessToken,
       'X-Emby-Authorization': EMY_AUTH_HEADER,
     },
     timeout: 20000,
   });
+}
+
+async function getSiloLibrary(cfg) {
+  let session = await getValidSession(cfg, false);
+  const cacheKey = `${session.serverUrl}::${session.userId}`;
+  const cached = libraryCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return { items: cached.items, session };
+  }
+
+  let res;
+  try {
+    res = await fetchItemsFromSilo(session);
+  } catch (err) {
+    // If Silo expired the token (401/403), force a fresh login and retry once
+    if (err.response && (err.response.status === 401 || err.response.status === 403) && cfg.username) {
+      console.log('[SiloBridge] Token expired, re-authenticating...');
+      session = await getValidSession(cfg, true);
+      res = await fetchItemsFromSilo(session);
+    } else {
+      throw err;
+    }
+  }
 
   const items = res.data?.Items || [];
   libraryCache.set(cacheKey, { timestamp: Date.now(), items });
-  return items;
+  return { items, session };
 }
 
 function parseStremioId(rawId) {
   const parts = String(rawId).split(':');
 
-  // IMDb ID: "tt0133093" or "tt0903747:1:1"
   if (parts[0].startsWith('tt')) {
     return {
       provider: 'Imdb',
@@ -92,7 +126,6 @@ function parseStremioId(rawId) {
     };
   }
 
-  // Prefixed IDs: "tmdb:603", "tvdb:81189:1:1", "anidb:1234"
   const map = { tmdb: 'Tmdb', tvdb: 'Tvdb', anidb: 'AniDB' };
   const provider = map[parts[0].toLowerCase()];
   if (provider && parts[1]) {
@@ -109,7 +142,6 @@ function parseStremioId(rawId) {
 
 function matchProviderId(item, provider, targetId) {
   if (!item?.ProviderIds) return false;
-  // Handle case-insensitive provider keys (e.g., Imdb vs imdb)
   for (const [key, val] of Object.entries(item.ProviderIds)) {
     if (key.toLowerCase() === provider.toLowerCase() && String(val) === String(targetId)) {
       return true;
@@ -148,7 +180,6 @@ function buildStreamCards(item, serverUrl, accessToken) {
     const details = [videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
     const fileName = source.Name || item.Name || 'Direct Stream';
 
-    // Collect external subtitle tracks if exposed by Silo
     const subtitles = streams
       .filter((s) => s.Type === 'Subtitle' && s.IsExternal)
       .map((sub) => ({
@@ -173,13 +204,12 @@ function buildStreamCards(item, serverUrl, accessToken) {
   });
 }
 
-// --- Manifest Helper ---
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'Silo Server',
-    description: 'Direct-play stream resolver for Silo Server (Jellyfin/Emby compatibility API)',
+    description: 'Direct-play stream resolver for Silo Server (auto-refreshing session)',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'tmdb:', 'tvdb:', 'anidb:'],
@@ -191,7 +221,6 @@ function getManifest(configured = false) {
   };
 }
 
-// --- Routes ---
 app.get('/', (_req, res) => {
   res.redirect('/configure');
 });
@@ -202,10 +231,10 @@ app.get('/manifest.json', (_req, res) => {
 
 app.get('/:config/manifest.json', (req, res) => {
   const cfg = decodeConfig(req.params.config);
-  res.json(getManifest(Boolean(cfg?.serverUrl && cfg?.userId && cfg?.accessToken)));
+  const isConfigured = Boolean(cfg?.serverUrl && (cfg?.username || (cfg?.userId && cfg?.accessToken)));
+  res.json(getManifest(isConfigured));
 });
 
-// Helper endpoint for the /configure UI to authenticate against Silo
 app.post('/api/auth', async (req, res) => {
   const { serverUrl, username, password } = req.body || {};
   if (!serverUrl || !username) {
@@ -213,10 +242,17 @@ app.post('/api/auth', async (req, res) => {
   }
 
   try {
-    const auth = await authenticateSilo(serverUrl, username, password || '');
-    const tokenConfig = encodeConfig(auth);
+    const baseUrl = serverUrl.replace(/\/+$/, '');
+    const session = await authenticateSilo(baseUrl, username, password || '');
+    // Store credentials so the bridge can auto-refresh expired tokens on demand
+    const tokenConfig = encodeConfig({
+      serverUrl: baseUrl,
+      username,
+      password: password || '',
+    });
+
     return res.json({
-      ...auth,
+      userId: session.userId,
       configToken: tokenConfig,
     });
   } catch (err) {
@@ -230,12 +266,11 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-// Stream Resolver Endpoint
 app.get('/:config/stream/:type/:id.json', async (req, res) => {
   const { config, type, id } = req.params;
   const cfg = decodeConfig(config);
 
-  if (!cfg?.serverUrl || !cfg?.userId || !cfg?.accessToken) {
+  if (!cfg?.serverUrl || (!cfg?.username && !cfg?.accessToken)) {
     return res.json({ streams: [] });
   }
 
@@ -245,7 +280,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
   }
 
   try {
-    const items = await getSiloLibrary(cfg.serverUrl, cfg.userId, cfg.accessToken);
+    const { items, session } = await getSiloLibrary(cfg);
     let matches = [];
 
     if (type === 'movie') {
@@ -270,18 +305,19 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
       );
     }
 
+    console.log(`[SiloBridge] Lookup ${type} ${id} -> ${matches.length} match(es) out of ${items.length} library items`);
+
     const streams = matches.flatMap((item) =>
-      buildStreamCards(item, cfg.serverUrl, cfg.accessToken)
+      buildStreamCards(item, session.serverUrl, session.accessToken)
     );
 
     return res.json({ streams });
   } catch (err) {
-    console.error('[SiloBridge] Stream lookup failed:', err.message);
+    console.error('[SiloBridge] Stream lookup failed:', err.response?.status || '', err.message);
     return res.json({ streams: [] });
   }
 });
 
-// --- Web Configuration Page ---
 app.get(['/configure', '/:config/configure'], (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -331,7 +367,7 @@ app.get(['/configure', '/:config/configure'], (_req, res) => {
     <div id="errorBox" class="result error"></div>
 
     <div id="successBox" class="result">
-      <div style="font-size:0.85rem;font-weight:600;color:#34d399;">Connected! Copy this Manifest URL into AIOStreams:</div>
+      <div style="font-size:0.85rem;font-weight:600;color:#34d399;">Connected! Copy this Manifest URL into Stremio or AIOStreams:</div>
       <div id="manifestUrl" class="manifest-box"></div>
       <div class="btn-row">
         <button type="button" class="btn-secondary" onclick="copyManifest()">Copy Manifest URL</button>
@@ -387,12 +423,12 @@ app.get(['/configure', '/:config/configure'], (_req, res) => {
     function copyManifest() {
       if (!generatedUrl) return;
       navigator.clipboard.writeText(generatedUrl);
-      alert('Manifest URL copied! Paste it into AIOStreams -> Addons -> Custom Addons.');
+      alert('Manifest URL copied!');
     }
 
     function installStremio() {
       if (!generatedUrl) return;
-      window.location.href = generatedUrl.replace(/^https?:\\/\\//, 'stremio://');
+      window.location.href = generatedUrl.replace(/^https?:\/\//, 'stremio://');
     }
   </script>
 </body>
@@ -400,4 +436,5 @@ app.get(['/configure', '/:config/configure'], (_req, res) => {
 });
 
 app.listen(PORT, () => {
-console.log(`Silo Stremio Bridge running on port ${PORT}`);});
+  console.log(`Silo Stremio Bridge running on port ${PORT}`);
+});

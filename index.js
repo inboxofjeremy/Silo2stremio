@@ -8,14 +8,12 @@ const PORT = process.env.PORT || 7000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory caches
+// Lightweight session & metadata caches only (no full library downloads)
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
-const libraryCache = new Map(); // key = `${serverUrl}::${userId}` -> { timestamp, items }
-const episodesCache = new Map(); // key = `${serverUrl}::${seriesId}` -> { timestamp, items }
-const CACHE_TTL_MS = 5 * 60 * 1000;
+const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.2.0"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.0"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -84,7 +82,7 @@ async function siloGet(cfg, path, params = {}) {
         'X-Emby-Token': session.accessToken,
         'X-Emby-Authorization': EMY_AUTH_HEADER,
       },
-      timeout: 20000,
+      timeout: 15000,
     });
     return { data: res.data, session };
   } catch (err) {
@@ -97,7 +95,7 @@ async function siloGet(cfg, path, params = {}) {
           'X-Emby-Token': session.accessToken,
           'X-Emby-Authorization': EMY_AUTH_HEADER,
         },
-        timeout: 20000,
+        timeout: 15000,
       });
       return { data: retry.data, session };
     }
@@ -105,79 +103,19 @@ async function siloGet(cfg, path, params = {}) {
   }
 }
 
-async function getSiloLibrary(cfg) {
-  const session = await getValidSession(cfg, false);
-  const cacheKey = `${session.serverUrl}::${session.userId}`;
-  const cached = libraryCache.get(cacheKey);
-
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return { items: cached.items, session };
-  }
-
-  const { data, session: activeSession } = await siloGet(
-    cfg,
-    `/Users/${session.userId}/Items`,
-    {
-      Recursive: true,
-      IncludeItemTypes: 'Movie,Series',
-      Fields: 'ProviderIds,MediaSources,Path',
-    }
-  );
-
-  const items = data?.Items || [];
-  libraryCache.set(cacheKey, { timestamp: Date.now(), items });
-  return { items, session: activeSession };
-}
-
-async function getSeriesEpisodes(cfg, seriesId) {
-  const session = await getValidSession(cfg, false);
-  const cacheKey = `${session.serverUrl}::${seriesId}`;
-  const cached = episodesCache.get(cacheKey);
-
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return { episodes: cached.items, session };
-  }
-
-  // Try standard Jellyfin /Shows/{seriesId}/Episodes endpoint first
-  let data;
-  let activeSession = session;
-  try {
-    const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
-      UserId: session.userId,
-      Fields: 'ProviderIds,MediaSources,Path',
-    });
-    data = res.data;
-    activeSession = res.session;
-  } catch {
-    // Fallback to ParentId query on /Users/{userId}/Items
-    const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
-      ParentId: seriesId,
-      Recursive: true,
-      IncludeItemTypes: 'Episode',
-      Fields: 'ProviderIds,MediaSources,Path',
-    });
-    data = res.data;
-    activeSession = res.session;
-  }
-
-  const episodes = data?.Items || [];
-  episodesCache.set(cacheKey, { timestamp: Date.now(), items: episodes });
-  return { episodes, session: activeSession };
-}
-
 function parseStremioId(rawId) {
   const parts = String(rawId).split(':');
 
   if (parts[0].startsWith('tt')) {
     return {
-      provider: 'Imdb',
+      provider: 'imdb',
       id: parts[0],
       season: parts[1] !== undefined ? Number(parts[1]) : null,
       episode: parts[2] !== undefined ? Number(parts[2]) : null,
     };
   }
 
-  const map = { tmdb: 'Tmdb', tvdb: 'Tvdb', anidb: 'AniDB' };
+  const map = { tmdb: 'tmdb', tvdb: 'tvdb', anidb: 'anidb' };
   const provider = map[parts[0].toLowerCase()];
   if (provider && parts[1]) {
     return {
@@ -199,6 +137,130 @@ function matchProviderId(item, provider, targetId) {
     }
   }
   return false;
+}
+
+function normalizeTitle(str) {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function resolveCinemetaInfo(type, baseId) {
+  const key = `${type}:${baseId}`;
+  if (metaCache.has(key)) return metaCache.get(key);
+
+  try {
+    const res = await axios.get(
+      `https://v3-cinemeta.strem.io/meta/${type}/${encodeURIComponent(baseId)}.json`,
+      { timeout: 6000 }
+    );
+    const meta = res.data?.meta;
+    if (meta?.name) {
+      const info = {
+        name: meta.name,
+        year: meta.releaseInfo ? parseInt(String(meta.releaseInfo).slice(0, 4), 10) : null,
+        imdb_id: meta.imdb_id || (baseId.startsWith('tt') ? baseId : null),
+      };
+      metaCache.set(key, info);
+      return info;
+    }
+  } catch {
+    // Ignore Cinemeta timeout/miss
+  }
+  return null;
+}
+
+async function searchSiloOnDemand(cfg, itemType, parsed) {
+  const session = await getValidSession(cfg, false);
+  const providerKey = `${parsed.provider}.${parsed.id}`;
+
+  // 1. Direct server-side lookup by Provider ID (fast, no full library fetch)
+  const { data: idData, session: activeSession } = await siloGet(
+    cfg,
+    `/Users/${session.userId}/Items`,
+    {
+      Recursive: true,
+      IncludeItemTypes: itemType,
+      AnyProviderIdEquals: providerKey,
+      Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
+      Limit: 25,
+    }
+  );
+
+  let items = (idData?.Items || []).filter((item) =>
+    matchProviderId(item, parsed.provider, parsed.id)
+  );
+
+  if (items.length > 0) {
+    return { matches: items, session: activeSession, method: 'ProviderId' };
+  }
+
+  // 2. Fallback: Resolve title via Cinemeta and query Silo's SearchTerm directly
+  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
+  const meta = await resolveCinemetaInfo(itemType === 'Movie' ? 'movie' : 'series', baseId);
+
+  if (meta?.name) {
+    const { data: searchData, session: searchSession } = await siloGet(
+      cfg,
+      `/Users/${session.userId}/Items`,
+      {
+        Recursive: true,
+        IncludeItemTypes: itemType,
+        SearchTerm: meta.name,
+        Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
+        Limit: 25,
+      }
+    );
+
+    const targetNorm = normalizeTitle(meta.name);
+    const candidates = searchData?.Items || [];
+
+    // Prefer exact provider ID match if returned by search, otherwise match normalized title (+ year for movies)
+    const exactIdMatch = candidates.filter((item) =>
+      matchProviderId(item, parsed.provider, parsed.id)
+    );
+    if (exactIdMatch.length > 0) {
+      return { matches: exactIdMatch, session: searchSession, method: 'SearchTerm+Id' };
+    }
+
+    const titleMatches = candidates.filter((item) => {
+      const itemNorm = normalizeTitle(item.Name);
+      const titleOk = itemNorm === targetNorm || itemNorm.startsWith(`${targetNorm} `);
+      if (!titleOk) return false;
+      if (itemType === 'Movie' && meta.year && item.ProductionYear) {
+        return Math.abs(Number(item.ProductionYear) - meta.year) <= 1;
+      }
+      return true;
+    });
+
+    if (titleMatches.length > 0) {
+      return { matches: titleMatches, session: searchSession, method: `Title(${meta.name})` };
+    }
+  }
+
+  return { matches: [], session: activeSession, method: 'None' };
+}
+
+async function getSeriesEpisodes(cfg, seriesId) {
+  const session = await getValidSession(cfg, false);
+  try {
+    const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
+      UserId: session.userId,
+      Fields: 'ProviderIds,MediaSources,Path',
+    });
+    return { episodes: res.data?.Items || [], session: res.session };
+  } catch {
+    const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+      ParentId: seriesId,
+      Recursive: true,
+      IncludeItemTypes: 'Episode',
+      Fields: 'ProviderIds,MediaSources,Path',
+      Limit: 1000,
+    });
+    return { episodes: res.data?.Items || [], session: res.session };
+  }
 }
 
 function formatBytes(bytes) {
@@ -259,9 +321,9 @@ function buildStreamCards(item, serverUrl, accessToken) {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.2.0',
+    version: '1.3.0',
     name: 'Silo Server',
-    description: 'Direct-play stream resolver for Silo Server (Movies & Series)',
+    description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'tmdb:', 'tvdb:', 'anidb:'],
@@ -317,20 +379,31 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-app.get('/:config/debug', async (req, res) => {
+// Quick on-demand search test endpoint: /:config/search?q=Dragons
+app.get('/:config/search', async (req, res) => {
   const cfg = decodeConfig(req.params.config);
   if (!cfg) return res.status(400).json({ error: 'Invalid config' });
 
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'Provide ?q=search_term' });
+
   try {
-    const { items } = await getSiloLibrary(cfg);
-    const summary = items.map((i) => ({
+    const session = await getValidSession(cfg, false);
+    const { data } = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+      Recursive: true,
+      IncludeItemTypes: 'Movie,Series',
+      SearchTerm: q,
+      Fields: 'ProviderIds,MediaSources,ProductionYear',
+      Limit: 25,
+    });
+    const items = (data?.Items || []).map((i) => ({
       Id: i.Id,
       Name: i.Name,
       Type: i.Type,
+      Year: i.ProductionYear,
       ProviderIds: i.ProviderIds || {},
-      HasMediaSources: Array.isArray(i.MediaSources) && i.MediaSources.length > 0,
     }));
-    return res.json({ count: items.length, items: summary });
+    return res.json({ query: q, count: items.length, items });
   } catch (err) {
     return res.status(500).json({ error: err.message, details: err.response?.data });
   }
@@ -350,20 +423,16 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
   }
 
   try {
-    const { items, session } = await getSiloLibrary(cfg);
+    const itemType = type === 'movie' ? 'Movie' : 'Series';
+    const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
+
     let matches = [];
     let activeSession = session;
 
     if (type === 'movie') {
-      matches = items.filter(
-        (item) => item.Type === 'Movie' && matchProviderId(item, parsed.provider, parsed.id)
-      );
+      matches = foundItems;
     } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
-      const matchingSeries = items.filter(
-        (item) => item.Type === 'Series' && matchProviderId(item, parsed.provider, parsed.id)
-      );
-
-      for (const series of matchingSeries) {
+      for (const series of foundItems) {
         const epRes = await getSeriesEpisodes(cfg, series.Id);
         activeSession = epRes.session;
         const epMatches = epRes.episodes.filter(
@@ -376,7 +445,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 
     console.log(
-      `[SiloBridge] Lookup ${type} ${id} -> ${matches.length} match(es) out of ${items.length} library items`
+      `[SiloBridge] On-demand ${type} ${id} via [${method}] -> ${matches.length} stream(s)`
     );
 
     const streams = matches.flatMap((item) =>

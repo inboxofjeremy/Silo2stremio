@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.5"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.6"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -320,9 +320,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
     const sizeStr = formatBytes(source.Size);
 
     const details = [resLabel, videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
-    
-    const displayName = seriesTitle || item.Name || 'Direct Stream';
-    const episodeTitle = seriesTitle && item.Name && item.Name !== seriesTitle ? ` — ${item.Name}` : '';
+    const displayName = seriesTitle || 'Direct Stream';
 
     const subtitles = streams
       .filter((s) => s.Type === 'Subtitle' && s.IsExternal)
@@ -337,7 +335,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 
     return {
       name: 'Silo',
-      title: `${displayName}${episodeTitle}\n${details}`,
+      title: `${displayName}\n${details}`,
       url: streamUrl,
       ...(subtitles.length > 0 ? { subtitles } : {}),
       behaviorHints: {
@@ -351,7 +349,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.5',
+    version: '1.3.6',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],

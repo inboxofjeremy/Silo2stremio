@@ -8,12 +8,12 @@ const PORT = process.env.PORT || 7000;
 app.use(cors());
 app.use(express.json());
 
-// Lightweight session & metadata caches only (no full library downloads)
+// Lightweight session & metadata caches only
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
 const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.0"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.1"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -176,7 +176,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   const session = await getValidSession(cfg, false);
   const providerKey = `${parsed.provider}.${parsed.id}`;
 
-  // 1. Direct server-side lookup by Provider ID (fast, no full library fetch)
+  // 1. Direct server-side lookup by Provider ID
   const { data: idData, session: activeSession } = await siloGet(
     cfg,
     `/Users/${session.userId}/Items`,
@@ -217,7 +217,6 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
     const targetNorm = normalizeTitle(meta.name);
     const candidates = searchData?.Items || [];
 
-    // Prefer exact provider ID match if returned by search, otherwise match normalized title (+ year for movies)
     const exactIdMatch = candidates.filter((item) =>
       matchProviderId(item, parsed.provider, parsed.id)
     );
@@ -227,7 +226,12 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
     const titleMatches = candidates.filter((item) => {
       const itemNorm = normalizeTitle(item.Name);
-      const titleOk = itemNorm === targetNorm || itemNorm.startsWith(`${targetNorm} `);
+      // Flexible matching to accommodate regional suffixes like (CA)
+      const titleOk =
+        itemNorm === targetNorm ||
+        itemNorm.startsWith(`${targetNorm} `) ||
+        targetNorm.startsWith(`${itemNorm} `);
+
       if (!titleOk) return false;
       if (itemType === 'Movie' && meta.year && item.ProductionYear) {
         return Math.abs(Number(item.ProductionYear) - meta.year) <= 1;
@@ -321,7 +325,7 @@ function buildStreamCards(item, serverUrl, accessToken) {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.0',
+    version: '1.3.1',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -379,7 +383,6 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-// Quick on-demand search test endpoint: /:config/search?q=Dragons
 app.get('/:config/search', async (req, res) => {
   const cfg = decodeConfig(req.params.config);
   if (!cfg) return res.status(400).json({ error: 'Invalid config' });

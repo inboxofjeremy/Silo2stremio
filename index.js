@@ -400,5 +400,4 @@ app.get(['/configure', '/:config/configure'], (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(\`Silo Stremio Bridge running on port \${PORT}\`);
-});
+console.log(`Silo Stremio Bridge running on port ${PORT}`);});

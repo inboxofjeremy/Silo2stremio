@@ -10,10 +10,10 @@ app.use(express.json());
 
 // Lightweight session & metadata caches only
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
-const metaCache = new Map(); // key = `${type}:${baseId}` -> { name, year, imdb_id, tmdb_id }
+const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.6"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.7"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -147,8 +147,8 @@ function normalizeTitle(str) {
     .trim();
 }
 
-async function resolveCinemetaInfo(type, baseId) {
-  const key = `${type}:${baseId}`;
+async function resolveCinemetaInfo(type, baseId, season = null, episode = null) {
+  const key = `${type}:${baseId}:${season || ''}:${episode || ''}`;
   if (metaCache.has(key)) return metaCache.get(key);
 
   try {
@@ -158,10 +158,25 @@ async function resolveCinemetaInfo(type, baseId) {
     );
     const meta = res.data?.meta;
     if (meta?.name) {
+      let epTitle = null;
+      let epReleased = null;
+
+      if (type === 'series' && Array.isArray(meta.videos) && season !== null && episode !== null) {
+        const video = meta.videos.find(
+          (v) => Number(v.season) === Number(season) && Number(v.episode) === Number(episode)
+        );
+        if (video) {
+          epTitle = video.name || video.title || null;
+          epReleased = video.released ? String(video.released).slice(0, 10) : null;
+        }
+      }
+
       const info = {
         name: meta.name,
         year: meta.releaseInfo ? parseInt(String(meta.releaseInfo).slice(0, 4), 10) : null,
         imdb_id: meta.imdb_id || (baseId.startsWith('tt') ? baseId : null),
+        epTitle,
+        epReleased,
       };
       metaCache.set(key, info);
       return info;
@@ -241,19 +256,17 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   return { matches: [], session: activeSession, method: 'None' };
 }
 
-async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode) {
+async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta = null) {
   const session = await getValidSession(cfg, false);
 
-  async function querySeason(seasonNum) {
+  async function fetchSeasonEpisodes(seasonNum) {
     try {
       const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
         UserId: session.userId,
         Season: seasonNum,
-        Fields: 'ProviderIds,MediaSources,Path',
+        Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
       });
-      const episodes = res.data?.Items || [];
-      const matched = episodes.filter((ep) => Number(ep.IndexNumber) === Number(targetEpisode));
-      return { episodes: matched, session: res.session };
+      return { episodes: res.data?.Items || [], session: res.session };
     } catch {
       const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
         ParentId: seriesId,
@@ -261,29 +274,50 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode) {
         IncludeItemTypes: 'Episode',
         ParentIndexNumber: seasonNum,
         IndexNumber: targetEpisode,
-        Fields: 'ProviderIds,MediaSources,Path',
-        Limit: 5,
+        Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
+        Limit: 100,
       });
       return { episodes: res.data?.Items || [], session: res.session };
     }
   }
 
-  // 1. STRICTLY try the exact season requested by Stremio first
-  let result = await querySeason(targetSeason);
-  if (result.episodes.length > 0) {
-    return result;
+  // 1. Strictly try exact season + episode index first
+  const primary = await fetchSeasonEpisodes(targetSeason);
+  const exactMatch = primary.episodes.filter(
+    (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
+  );
+  if (exactMatch.length > 0) {
+    return { episodes: exactMatch, session: primary.session };
   }
 
-  // 2. Only if the exact season returned nothing, check for broadcast year mismatches
+  // 2. Year-based fallback: match by episode title or premiere air date if seasons are year-indexed
   const currentYear = new Date().getFullYear();
-  const possibleYears = [currentYear, currentYear - 1, currentYear - 2, 2026, 2025, 2024];
+  const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
+  const possibleYears = [...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean))];
 
-  if (!possibleYears.includes(targetSeason)) {
+  if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
+    const targetEpNorm = normalizeTitle(meta.epTitle);
+
     for (const yearSeason of possibleYears) {
-      result = await querySeason(yearSeason);
-      if (result.episodes.length > 0) {
-        console.log(`[SiloBridge] Season fallback: mapped season ${targetSeason} -> ${yearSeason}`);
-        return result;
+      const yearRes = await fetchSeasonEpisodes(yearSeason);
+      if (yearRes.episodes.length === 0) continue;
+
+      let matched = yearRes.episodes.filter((ep) => {
+        const epNorm = normalizeTitle(ep.Name);
+        return targetEpNorm && (epNorm === targetEpNorm || epNorm.includes(targetEpNorm) || targetEpNorm.includes(epNorm));
+      });
+
+      if (matched.length === 0 && meta.epReleased) {
+        matched = yearRes.episodes.filter(
+          (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
+        );
+      }
+
+      if (matched.length > 0) {
+        console.log(
+          `[SiloBridge] Year-season match: S${targetSeason}E${targetEpisode} -> S${yearSeason}E${matched[0].IndexNumber} (${matched[0].Name})`
+        );
+        return { episodes: matched, session: yearRes.session };
       }
     }
   }
@@ -349,7 +383,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.6',
+    version: '1.3.7',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -456,11 +490,17 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     let matches = [];
     let activeSession = session;
 
+    const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
+    const epMeta =
+      type === 'series' && parsed.season !== null && parsed.episode !== null
+        ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
+        : null;
+
     if (type === 'movie') {
       matches = foundItems;
     } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
       for (const series of foundItems) {
-        const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode);
+        const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode, epMeta);
         activeSession = epRes.session;
         matches.push(...epRes.episodes);
       }

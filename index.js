@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.7"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.8"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -26,6 +26,10 @@ function decodeConfig(encoded) {
   } catch {
     return null;
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function authenticateSilo(serverUrl, username, password) {
@@ -73,7 +77,7 @@ async function getValidSession(cfg, forceRefresh = false) {
   return authenticateSilo(baseUrl, cfg.username, cfg.password);
 }
 
-async function siloGet(cfg, path, params = {}) {
+async function siloGet(cfg, path, params = {}, attempt = 0) {
   let session = await getValidSession(cfg, false);
   try {
     const res = await axios.get(`${session.serverUrl}${path}`, {
@@ -86,19 +90,24 @@ async function siloGet(cfg, path, params = {}) {
     });
     return { data: res.data, session };
   } catch (err) {
-    if (err.response && (err.response.status === 401 || err.response.status === 403) && cfg.username) {
+    const status = err.response?.status;
+
+    if ((status === 401 || status === 403) && cfg.username && attempt === 0) {
       console.log('[SiloBridge] Token expired, re-authenticating...');
-      session = await getValidSession(cfg, true);
-      const retry = await axios.get(`${session.serverUrl}${path}`, {
-        params,
-        headers: {
-          'X-Emby-Token': session.accessToken,
-          'X-Emby-Authorization': EMY_AUTH_HEADER,
-        },
-        timeout: 15000,
-      });
-      return { data: retry.data, session };
+      await getValidSession(cfg, true);
+      return siloGet(cfg, path, params, attempt + 1);
     }
+
+    if (status === 429 && attempt < 2) {
+      const retryAfterHeader = Number(err.response?.headers?.['retry-after']);
+      const delayMs = !Number.isNaN(retryAfterHeader) && retryAfterHeader > 0
+        ? Math.min(retryAfterHeader * 1000, 4000)
+        : 600 * (attempt + 1);
+      console.log(`[SiloBridge] Hit 429 on ${path}, retrying in ${delayMs}ms...`);
+      await sleep(delayMs);
+      return siloGet(cfg, path, params, attempt + 1);
+    }
+
     throw err;
   }
 }
@@ -364,8 +373,11 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
         url: `${serverUrl}/Videos/${item.Id}/${source.Id}/Subtitles/${sub.Index}/Stream.vtt?api_key=${accessToken}`,
       }));
 
-    const containerExt = source.Container ? `.${source.Container.split(',')[0]}` : '';
-    const streamUrl = `${serverUrl}/Videos/${item.Id}/stream${containerExt}?static=true&MediaSourceId=${source.Id}&api_key=${accessToken}`;
+    // Direct file download endpoint avoids /Videos/.../stream playback session slot tracking
+    const mediaSourceParam = source.Id && source.Id !== item.Id
+      ? `&MediaSourceId=${encodeURIComponent(source.Id)}`
+      : '';
+    const streamUrl = `${serverUrl}/Items/${item.Id}/Download?api_key=${accessToken}${mediaSourceParam}`;
 
     return {
       name: 'Silo',
@@ -383,7 +395,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.7',
+    version: '1.3.8',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],

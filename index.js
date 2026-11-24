@@ -13,7 +13,7 @@ const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId
 const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.8"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.9"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -373,11 +373,8 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
         url: `${serverUrl}/Videos/${item.Id}/${source.Id}/Subtitles/${sub.Index}/Stream.vtt?api_key=${accessToken}`,
       }));
 
-    // Direct file download endpoint avoids /Videos/.../stream playback session slot tracking
-    const mediaSourceParam = source.Id && source.Id !== item.Id
-      ? `&MediaSourceId=${encodeURIComponent(source.Id)}`
-      : '';
-    const streamUrl = `${serverUrl}/Items/${item.Id}/Download?api_key=${accessToken}${mediaSourceParam}`;
+    // Standard Emby/StreamBridge static stream route
+    const streamUrl = `${serverUrl}/Videos/${item.Id}/stream?static=true&MediaSourceId=${encodeURIComponent(source.Id)}&api_key=${accessToken}`;
 
     return {
       name: 'Silo',
@@ -395,7 +392,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.8',
+    version: '1.3.9',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],

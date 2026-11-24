@@ -8,12 +8,16 @@ const PORT = process.env.PORT || 7000;
 app.use(cors());
 app.use(express.json());
 
-// Lightweight session & metadata caches only
+// Lightweight session, metadata, and short-TTL stream caches
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
 const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
+const streamCache = new Map(); // key = `${config}::${type}::${id}` -> { expiresAt, streams }
+const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promise
+
+const STREAM_CACHE_TTL_MS = 60 * 1000;
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.3.9"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.0"';
 
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
@@ -102,7 +106,7 @@ async function siloGet(cfg, path, params = {}, attempt = 0) {
       const retryAfterHeader = Number(err.response?.headers?.['retry-after']);
       const delayMs = !Number.isNaN(retryAfterHeader) && retryAfterHeader > 0
         ? Math.min(retryAfterHeader * 1000, 4000)
-        : 600 * (attempt + 1);
+        : 750 * (attempt + 1);
       console.log(`[SiloBridge] Hit 429 on ${path}, retrying in ${delayMs}ms...`);
       await sleep(delayMs);
       return siloGet(cfg, path, params, attempt + 1);
@@ -200,7 +204,6 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   const session = await getValidSession(cfg, false);
   const providerKey = `${parsed.provider}.${parsed.id}`;
 
-  // 1. Direct server-side lookup by Provider ID
   const { data: idData, session: activeSession } = await siloGet(
     cfg,
     `/Users/${session.userId}/Items`,
@@ -213,7 +216,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
     }
   );
 
-  let items = (idData?.Items || []).filter((item) =>
+  const items = (idData?.Items || []).filter((item) =>
     matchProviderId(item, parsed.provider, parsed.id)
   );
 
@@ -221,7 +224,6 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
     return { matches: [items[0]], session: activeSession, method: 'ProviderId' };
   }
 
-  // 2. Fallback: Resolve title via Cinemeta and query Silo's SearchTerm directly
   const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
   const meta = await resolveCinemetaInfo(itemType === 'Movie' ? 'movie' : 'series', baseId);
 
@@ -290,7 +292,6 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
     }
   }
 
-  // 1. Strictly try exact season + episode index first
   const primary = await fetchSeasonEpisodes(targetSeason);
   const exactMatch = primary.episodes.filter(
     (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
@@ -299,7 +300,6 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
     return { episodes: exactMatch, session: primary.session };
   }
 
-  // 2. Year-based fallback: match by episode title or premiere air date if seasons are year-indexed
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
   const possibleYears = [...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean))];
@@ -307,7 +307,11 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
   if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
     const targetEpNorm = normalizeTitle(meta.epTitle);
 
-    for (const yearSeason of possibleYears) {
+    for (let i = 0; i < possibleYears.length; i++) {
+      if (i > 0) {
+        await sleep(200);
+      }
+      const yearSeason = possibleYears[i];
       const yearRes = await fetchSeasonEpisodes(yearSeason);
       if (yearRes.episodes.length === 0) continue;
 
@@ -373,7 +377,6 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
         url: `${serverUrl}/Videos/${item.Id}/${source.Id}/Subtitles/${sub.Index}/Stream.vtt?api_key=${accessToken}`,
       }));
 
-    // Standard Emby/StreamBridge static stream route
     const streamUrl = `${serverUrl}/Videos/${item.Id}/stream?static=true&MediaSourceId=${encodeURIComponent(source.Id)}&api_key=${accessToken}`;
 
     return {
@@ -392,7 +395,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.3.9',
+    version: '1.4.0',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -479,6 +482,43 @@ app.get('/:config/search', async (req, res) => {
   }
 });
 
+async function computeStreams(config, cfg, type, id) {
+  const parsed = parseStremioId(id);
+  if (!parsed) {
+    return [];
+  }
+
+  const itemType = type === 'movie' ? 'Movie' : 'Series';
+  const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
+
+  let matches = [];
+  let activeSession = session;
+
+  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
+  const epMeta =
+    type === 'series' && parsed.season !== null && parsed.episode !== null
+      ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
+      : null;
+
+  if (type === 'movie') {
+    matches = foundItems;
+  } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
+    for (const series of foundItems) {
+      const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode, epMeta);
+      activeSession = epRes.session;
+      matches.push(...epRes.episodes);
+    }
+  }
+
+  console.log(
+    `[SiloBridge] On-demand ${type} ${id} via [${method}] -> ${matches.length} stream(s)`
+  );
+
+  return matches.flatMap((item) =>
+    buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, foundItems[0]?.Name)
+  );
+}
+
 app.get('/:config/stream/:type/:id.json', async (req, res) => {
   const { config, type, id } = req.params;
   const cfg = decodeConfig(config);
@@ -487,47 +527,38 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     return res.json({ streams: [] });
   }
 
-  const parsed = parseStremioId(id);
-  if (!parsed) {
-    return res.json({ streams: [] });
+  const cacheKey = `${config}::${type}::${id}`;
+  const now = Date.now();
+  const cached = streamCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return res.json({ streams: cached.streams });
   }
 
-  try {
-    const itemType = type === 'movie' ? 'Movie' : 'Series';
-    const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
-
-    let matches = [];
-    let activeSession = session;
-
-    const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
-    const epMeta =
-      type === 'series' && parsed.season !== null && parsed.episode !== null
-        ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
-        : null;
-
-    if (type === 'movie') {
-      matches = foundItems;
-    } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
-      for (const series of foundItems) {
-        const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode, epMeta);
-        activeSession = epRes.session;
-        matches.push(...epRes.episodes);
-      }
+  if (inflightLookups.has(cacheKey)) {
+    try {
+      const streams = await inflightLookups.get(cacheKey);
+      return res.json({ streams });
+    } catch {
+      return res.json({ streams: [] });
     }
-
-    console.log(
-      `[SiloBridge] On-demand ${type} ${id} via [${method}] -> ${matches.length} stream(s)`
-    );
-
-    const streams = matches.flatMap((item) =>
-      buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, foundItems[0]?.Name)
-    );
-
-    return res.json({ streams });
-  } catch (err) {
-    console.error('[SiloBridge] Stream lookup failed:', err.response?.status || '', err.message);
-    return res.json({ streams: [] });
   }
+
+  const promise = (async () => {
+    try {
+      const streams = await computeStreams(config, cfg, type, id);
+      streamCache.set(cacheKey, { expiresAt: Date.now() + STREAM_CACHE_TTL_MS, streams });
+      return streams;
+    } catch (err) {
+      console.error('[SiloBridge] Stream lookup failed:', err.response?.status || '', err.message);
+      return [];
+    } finally {
+      inflightLookups.delete(cacheKey);
+    }
+  })();
+
+  inflightLookups.set(cacheKey, promise);
+  const streams = await promise;
+  return res.json({ streams });
 });
 
 app.get(['/configure', '/:config/configure'], (_req, res) => {

@@ -377,7 +377,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   const candidates = await resolveEquivalentIds(parsed, itemType, cfg);
   let activeSession = session;
 
-  // Check every available ID (imdb, tmdb, tvdb) strictly by ID and return as soon as any one matches
+  // Look up 1 matching item per candidate ID (imdb, tmdb, tvdb) and stop on the first match
   for (const cand of candidates) {
     const providerKey = `${cand.provider}.${cand.id}`;
     const { data: idData, session: nextSession } = await siloGet(
@@ -388,7 +388,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
         IncludeItemTypes: itemType,
         AnyProviderIdEquals: providerKey,
         Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
-        Limit: 500,
+        Limit: 1,
       }
     );
     activeSession = nextSession;

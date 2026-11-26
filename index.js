@@ -264,28 +264,40 @@ async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
 
   const found = new Map([[`${incoming.provider}:${incoming.id}`, incoming]]);
   const stremioType = itemType === 'Movie' ? 'movie' : 'series';
-  const tmdbKey = cfg?.tmdbApiKey || process.env.TMDB_API_KEY;
+  const tmdbKey = (cfg?.tmdbApiKey || process.env.TMDB_API_KEY || '').trim();
 
-  // 1. If starting with TMDB and TMDB_API_KEY is configured, fetch /external_ids directly
-  if (parsed.provider === 'tmdb' && tmdbKey) {
-    const tmdbPath = itemType === 'Movie' ? 'movie' : 'tv';
-    try {
-      const res = await axios.get(
-        `https://api.themoviedb.org/3/${tmdbPath}/${encodeURIComponent(parsed.id)}/external_ids`,
-        {
-          params: { api_key: tmdbKey },
-          timeout: 5000,
+  // 1. If starting with TMDB and TMDB_API_KEY is configured, fetch /external_ids via v3 api_key
+  if (parsed.provider === 'tmdb') {
+    if (!tmdbKey) {
+      console.log('[SiloBridge] TMDB_API_KEY is empty/missing');
+    } else {
+      const tmdbPath = itemType === 'Movie' ? 'movie' : 'tv';
+      try {
+        const res = await axios.get(
+          `https://api.themoviedb.org/3/${tmdbPath}/${encodeURIComponent(parsed.id)}/external_ids`,
+          {
+            params: { api_key: tmdbKey },
+            timeout: 5000,
+          }
+        );
+        const ext = res.data || {};
+        console.log('[SiloBridge] TMDB external_ids:', {
+          imdb_id: ext.imdb_id,
+          tvdb_id: ext.tvdb_id,
+        });
+        if (ext.imdb_id && String(ext.imdb_id).startsWith('tt')) {
+          found.set(`imdb:${ext.imdb_id}`, { provider: 'imdb', id: String(ext.imdb_id) });
         }
-      );
-      const ext = res.data || {};
-      if (ext.imdb_id && String(ext.imdb_id).startsWith('tt')) {
-        found.set(`imdb:${ext.imdb_id}`, { provider: 'imdb', id: String(ext.imdb_id) });
+        if (ext.tvdb_id) {
+          found.set(`tvdb:${ext.tvdb_id}`, { provider: 'tvdb', id: String(ext.tvdb_id) });
+        }
+      } catch (err) {
+        console.log(
+          '[SiloBridge] TMDB external_ids error:',
+          err.response?.status || err.message,
+          err.response?.data?.status_message || ''
+        );
       }
-      if (ext.tvdb_id) {
-        found.set(`tvdb:${ext.tvdb_id}`, { provider: 'tvdb', id: String(ext.tvdb_id) });
-      }
-    } catch {
-      // Ignore TMDB external_ids miss
     }
   }
 
@@ -347,6 +359,7 @@ async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
   }
 
   const list = Array.from(found.values());
+  console.log('[SiloBridge] ID candidates:', list.map((c) => `${c.provider}:${c.id}`).join(', '));
   idMapCache.set(cacheKey, list);
   return list;
 }
@@ -380,8 +393,10 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
     );
     activeSession = nextSession;
 
-    const items = (idData?.Items || []).filter((item) =>
-      matchProviderId(item, cand.provider, cand.id)
+    const rawItems = idData?.Items || [];
+    const items = rawItems.filter((item) => matchProviderId(item, cand.provider, cand.id));
+    console.log(
+      `[SiloBridge] Query ${providerKey}: raw=${rawItems.length}, matched=${items.length}`
     );
 
     if (items.length > 0) {

@@ -201,7 +201,7 @@ async function resolveCinemetaInfo(type, baseId, season = null, episode = null) 
     // Fall through to TVMaze fallback for series
   }
 
-  // 2. Fallback to TVMaze for series when Cinemeta misses (e.g., tmdb:1554 or tvdb:...)
+  // 2. Fallback to TVMaze for series when Cinemeta misses
   if (type === 'series') {
     try {
       const [prefix, rawVal] = baseId.includes(':') ? baseId.split(':') : ['imdb', baseId];
@@ -254,7 +254,7 @@ async function resolveCinemetaInfo(type, baseId, season = null, episode = null) 
   return null;
 }
 
-async function resolveEquivalentIds(parsed, itemType = 'Series') {
+async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
   const incoming = { provider: parsed.provider, id: String(parsed.id) };
   const cacheKey = `${itemType}:${parsed.provider}:${parsed.id}`;
 
@@ -262,11 +262,34 @@ async function resolveEquivalentIds(parsed, itemType = 'Series') {
     return idMapCache.get(cacheKey);
   }
 
-  // Always retain the incoming ID first, even if other IDs are missing externally or on Silo
   const found = new Map([[`${incoming.provider}:${incoming.id}`, incoming]]);
   const stremioType = itemType === 'Movie' ? 'movie' : 'series';
+  const tmdbKey = cfg?.tmdbApiKey || process.env.TMDB_API_KEY;
 
-  // 1. Check Cinemeta for linked imdb_id when starting with imdb or tmdb
+  // 1. If starting with TMDB and TMDB_API_KEY is configured, fetch /external_ids directly
+  if (parsed.provider === 'tmdb' && tmdbKey) {
+    const tmdbPath = itemType === 'Movie' ? 'movie' : 'tv';
+    try {
+      const res = await axios.get(
+        `https://api.themoviedb.org/3/${tmdbPath}/${encodeURIComponent(parsed.id)}/external_ids`,
+        {
+          params: { api_key: tmdbKey },
+          timeout: 5000,
+        }
+      );
+      const ext = res.data || {};
+      if (ext.imdb_id && String(ext.imdb_id).startsWith('tt')) {
+        found.set(`imdb:${ext.imdb_id}`, { provider: 'imdb', id: String(ext.imdb_id) });
+      }
+      if (ext.tvdb_id) {
+        found.set(`tvdb:${ext.tvdb_id}`, { provider: 'tvdb', id: String(ext.tvdb_id) });
+      }
+    } catch {
+      // Ignore TMDB external_ids miss
+    }
+  }
+
+  // 2. Check Cinemeta for linked imdb_id when starting with imdb or tmdb
   if (parsed.provider === 'imdb' || parsed.provider === 'tmdb') {
     const metaId = parsed.provider === 'imdb' ? parsed.id : `tmdb:${parsed.id}`;
     try {
@@ -279,11 +302,11 @@ async function resolveEquivalentIds(parsed, itemType = 'Series') {
         found.set(`imdb:${imdbId}`, { provider: 'imdb', id: String(imdbId) });
       }
     } catch {
-      // Ignore Cinemeta miss; keep whatever IDs we already have
+      // Ignore Cinemeta miss
     }
   }
 
-  // 2. For series, check TVMaze lookup by imdb or tvdb to recover any linked imdb / tvdb IDs
+  // 3. For series, check TVMaze lookup by imdb or tvdb to recover any linked imdb / tvdb IDs
   if (itemType === 'Series') {
     const imdbCandidate = Array.from(found.values()).find((c) => c.provider === 'imdb');
     const tvdbCandidate = Array.from(found.values()).find((c) => c.provider === 'tvdb');
@@ -319,7 +342,7 @@ async function resolveEquivalentIds(parsed, itemType = 'Series') {
         }
       }
     } catch {
-      // Ignore TVMaze miss; partial ID set still works
+      // Ignore TVMaze miss
     }
   }
 
@@ -338,7 +361,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   }
 
   const session = await getValidSession(cfg, false);
-  const candidates = await resolveEquivalentIds(parsed, itemType);
+  const candidates = await resolveEquivalentIds(parsed, itemType, cfg);
   let activeSession = session;
 
   // Check every available ID (imdb, tmdb, tvdb) strictly by ID and return as soon as any one matches
@@ -545,254 +568,4 @@ app.post('/api/auth', async (req, res) => {
   }
 
   try {
-    const baseUrl = serverUrl.replace(/\/+$/, '');
-    const session = await authenticateSilo(baseUrl, username, password || '');
-    const tokenConfig = encodeConfig({
-      serverUrl: baseUrl,
-      username,
-      password: password || '',
-    });
-
-    return res.json({
-      userId: session.userId,
-      configToken: tokenConfig,
-    });
-  } catch (err) {
-    const status = err.response?.status || 500;
-    const msg =
-      err.response?.data?.Message ||
-      err.response?.data?.error ||
-      err.message ||
-      'Failed to connect to Silo Server.';
-    return res.status(status).json({ error: msg });
-  }
-});
-
-app.get('/:config/search', async (req, res) => {
-  const cfg = decodeConfig(req.params.config);
-  if (!cfg) return res.status(400).json({ error: 'Invalid config' });
-
-  const q = String(req.query.q || '').trim();
-  if (!q) return res.status(400).json({ error: 'Provide ?q=search_term' });
-
-  try {
-    const session = await getValidSession(cfg, false);
-    const { data } = await siloGet(cfg, `/Users/${session.userId}/Items`, {
-      Recursive: true,
-      IncludeItemTypes: 'Movie,Series',
-      SearchTerm: q,
-      Fields: 'ProviderIds,MediaSources,ProductionYear',
-      Limit: 25,
-    });
-    const items = (data?.Items || []).map((i) => ({
-      Id: i.Id,
-      Name: i.Name,
-      Type: i.Type,
-      Year: i.ProductionYear,
-      ProviderIds: i.ProviderIds || {},
-    }));
-    return res.json({ query: q, count: items.length, items });
-  } catch (err) {
-    return res.status(500).json({ error: err.message, details: err.response?.data });
-  }
-});
-
-async function computeStreams(config, cfg, type, id) {
-  const parsed = parseStremioId(id);
-  if (!parsed) {
-    return [];
-  }
-
-  const itemType = type === 'movie' ? 'Movie' : 'Series';
-  const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
-
-  let matches = [];
-  let activeSession = session;
-
-  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
-  const epMeta =
-    type === 'series' && parsed.season !== null && parsed.episode !== null
-      ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
-      : null;
-
-  if (type === 'movie') {
-    matches = foundItems;
-  } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
-    for (const series of foundItems) {
-      const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode, epMeta);
-      activeSession = epRes.session;
-      matches.push(...epRes.episodes);
-    }
-  }
-
-  console.log(
-    `[SiloBridge] On-demand ${type} ${id} via [${method}] -> ${matches.length} stream(s)`
-  );
-
-  return matches.flatMap((item) =>
-    buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, foundItems[0]?.Name)
-  );
-}
-
-app.get('/:config/stream/:type/:id.json', async (req, res) => {
-  const { config, type, id } = req.params;
-  const cfg = decodeConfig(config);
-
-  if (!cfg?.serverUrl || (!cfg?.username && !cfg?.accessToken)) {
-    return res.json({ streams: [] });
-  }
-
-  const cacheKey = `${config}::${type}::${id}`;
-  const now = Date.now();
-  const cached = streamCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) {
-    return res.json({ streams: cached.streams });
-  }
-
-  if (inflightLookups.has(cacheKey)) {
-    try {
-      const streams = await inflightLookups.get(cacheKey);
-      return res.json({ streams });
-    } catch {
-      return res.json({ streams: [] });
-    }
-  }
-
-  const promise = (async () => {
-    try {
-      const streams = await computeStreams(config, cfg, type, id);
-      streamCache.set(cacheKey, { expiresAt: Date.now() + STREAM_CACHE_TTL_MS, streams });
-      return streams;
-    } catch (err) {
-      console.error('[SiloBridge] Stream lookup failed:', err.response?.status || '', err.message);
-      return [];
-    } finally {
-      inflightLookups.delete(cacheKey);
-    }
-  })();
-
-  inflightLookups.set(cacheKey, promise);
-  const streams = await promise;
-  return res.json({ streams });
-});
-
-app.get(['/configure', '/:config/configure'], (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Silo Server — Stremio & AIOStreams Bridge</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e5e7eb; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
-    .card { background: #181b23; border: 1px solid #2a2f3d; border-radius: 12px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 12px 32px rgba(0,0,0,0.4); }
-    h1 { font-size: 1.35rem; margin: 0 0 6px; color: #fff; }
-    p.sub { font-size: 0.9rem; color: #9ca3af; margin: 0 0 20px; }
-    label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; color: #d1d5db; }
-    input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #0f1117; color: #fff; font-size: 0.95rem; margin-bottom: 14px; }
-    input:focus { outline: none; border-color: #6366f1; }
-    .hint { font-size: 0.78rem; color: #9ca3af; margin: -10px 0 14px; }
-    button { width: 100%; padding: 11px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; background: #6366f1; color: #fff; transition: background 0.15s; }
-    button:hover { background: #4f46e5; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    .result { margin-top: 18px; padding: 14px; border-radius: 8px; background: #0f1117; border: 1px solid #2a2f3d; display: none; }
-    .result.error { border-color: #ef4444; color: #fca5a5; }
-    .manifest-box { word-break: break-all; font-family: monospace; font-size: 0.82rem; color: #a5b4fc; background: #141720; padding: 10px; border-radius: 6px; margin: 10px 0; }
-    .btn-row { display: flex; gap: 8px; margin-top: 10px; }
-    .btn-secondary { background: #262b38; }
-    .btn-secondary:hover { background: #323848; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Silo Server Bridge</h1>
-    <p class="sub">Connect your Silo Server library to Stremio or AIOStreams.</p>
-
-    <label for="serverUrl">Silo Compatibility Server URL</label>
-    <input id="serverUrl" type="url" placeholder="https://bmsilo1-jf.appboxmanager.xyz" required />
-    <div class="hint">Use your Silo Jellyfin/Emby compatibility URL (no trailing slash).</div>
-
-    <label for="username">Username</label>
-    <input id="username" type="text" placeholder="Username or Username#ProfileName" required />
-    <div class="hint">Include #ProfileName if you use Silo household profiles.</div>
-
-    <label for="password">Password</label>
-    <input id="password" type="password" placeholder="Password (or Password#PIN)" />
-
-    <button id="connectBtn" onclick="connectSilo()">Generate Manifest URL</button>
-
-    <div id="errorBox" class="result error"></div>
-
-    <div id="successBox" class="result">
-      <div style="font-size:0.85rem;font-weight:600;color:#34d399;">Connected! Copy this Manifest URL into Stremio or AIOStreams:</div>
-      <div id="manifestUrl" class="manifest-box"></div>
-      <div class="btn-row">
-        <button type="button" class="btn-secondary" onclick="copyManifest()">Copy Manifest URL</button>
-        <button type="button" onclick="installStremio()">Install in Stremio</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let generatedUrl = '';
-
-    async function connectSilo() {
-      const btn = document.getElementById('connectBtn');
-      const errorBox = document.getElementById('errorBox');
-      const successBox = document.getElementById('successBox');
-      errorBox.style.display = 'none';
-      successBox.style.display = 'none';
-
-      const serverUrl = document.getElementById('serverUrl').value.trim();
-      const username = document.getElementById('username').value.trim();
-      const password = document.getElementById('password').value;
-
-      if (!serverUrl || !username) {
-        errorBox.textContent = 'Please enter both Server URL and Username.';
-        errorBox.style.display = 'block';
-        return;
-      }
-
-      btn.disabled = true;
-      btn.textContent = 'Connecting to Silo...';
-
-      try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ serverUrl, username, password })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Login failed');
-
-        generatedUrl = window.location.origin + '/' + data.configToken + '/manifest.json';
-        document.getElementById('manifestUrl').textContent = generatedUrl;
-        successBox.style.display = 'block';
-      } catch (err) {
-        errorBox.textContent = err.message;
-        errorBox.style.display = 'block';
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Generate Manifest URL';
-      }
-    }
-
-    function copyManifest() {
-      if (!generatedUrl) return;
-      navigator.clipboard.writeText(generatedUrl);
-      alert('Manifest URL copied!');
-    }
-
-    function installStremio() {
-      if (!generatedUrl) return;
-      window.location.href = generatedUrl.replace('https://', 'stremio://').replace('http://', 'stremio://');
-    }
-  </script>
-</body>
-</html>`);
-});
-
-app.listen(PORT, () => {
-  console.log(`Silo Stremio Bridge running on port ${PORT}`);
-});
+    const baseUrl

@@ -8,9 +8,10 @@ const PORT = process.env.PORT || 7000;
 app.use(cors());
 app.use(express.json());
 
-// Lightweight session, metadata, and short-TTL stream caches
+// Lightweight session, metadata, ID-map, and short-TTL stream caches
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
 const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
+const idMapCache = new Map(); // key = `${itemType}:${provider}:${id}` -> Array<{ provider, id }>
 const streamCache = new Map(); // key = `${config}::${type}::${id}` -> { expiresAt, streams }
 const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promise
 
@@ -104,9 +105,10 @@ async function siloGet(cfg, path, params = {}, attempt = 0) {
 
     if (status === 429 && attempt < 2) {
       const retryAfterHeader = Number(err.response?.headers?.['retry-after']);
-      const delayMs = !Number.isNaN(retryAfterHeader) && retryAfterHeader > 0
-        ? Math.min(retryAfterHeader * 1000, 4000)
-        : 750 * (attempt + 1);
+      const delayMs =
+        !Number.isNaN(retryAfterHeader) && retryAfterHeader > 0
+          ? Math.min(retryAfterHeader * 1000, 4000)
+          : 750 * (attempt + 1);
       console.log(`[SiloBridge] Hit 429 on ${path}, retrying in ${delayMs}ms...`);
       await sleep(delayMs);
       return siloGet(cfg, path, params, attempt + 1);
@@ -128,7 +130,7 @@ function parseStremioId(rawId) {
     };
   }
 
-  const map = { tmdb: 'tmdb', tvdb: 'tvdb', anidb: 'anidb' };
+  const map = { tmdb: 'tmdb', tvdb: 'tvdb' };
   const provider = map[parts[0].toLowerCase()];
   if (provider && parts[1]) {
     return {
@@ -164,6 +166,7 @@ async function resolveCinemetaInfo(type, baseId, season = null, episode = null) 
   const key = `${type}:${baseId}:${season || ''}:${episode || ''}`;
   if (metaCache.has(key)) return metaCache.get(key);
 
+  // 1. Try Cinemeta first
   try {
     const res = await axios.get(
       `https://v3-cinemeta.strem.io/meta/${type}/${encodeURIComponent(baseId)}.json`,
@@ -195,72 +198,175 @@ async function resolveCinemetaInfo(type, baseId, season = null, episode = null) 
       return info;
     }
   } catch {
-    // Ignore Cinemeta timeout/miss
+    // Fall through to TVMaze fallback for series
   }
+
+  // 2. Fallback to TVMaze for series when Cinemeta misses (e.g., tmdb:1554 or tvdb:...)
+  if (type === 'series') {
+    try {
+      const [prefix, rawVal] = baseId.includes(':') ? baseId.split(':') : ['imdb', baseId];
+      let showData = null;
+
+      if (prefix === 'imdb' && rawVal.startsWith('tt')) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?imdb=${encodeURIComponent(rawVal)}`,
+          { timeout: 6000 }
+        );
+        showData = r.data;
+      } else if (prefix === 'tvdb') {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?thetvdb=${encodeURIComponent(rawVal)}`,
+          { timeout: 6000 }
+        );
+        showData = r.data;
+      }
+
+      if (showData?.id && showData?.name) {
+        let epTitle = null;
+        let epReleased = null;
+
+        if (season !== null && episode !== null) {
+          const epRes = await axios.get(
+            `https://api.tvmaze.com/shows/${showData.id}/episodebynumber?season=${Number(season)}&number=${Number(episode)}`,
+            { timeout: 6000 }
+          );
+          if (epRes.data) {
+            epTitle = epRes.data.name || null;
+            epReleased = epRes.data.airdate ? String(epRes.data.airdate).slice(0, 10) : null;
+          }
+        }
+
+        const info = {
+          name: showData.name,
+          year: showData.premiered ? parseInt(String(showData.premiered).slice(0, 4), 10) : null,
+          imdb_id: showData.externals?.imdb || null,
+          epTitle,
+          epReleased,
+        };
+        metaCache.set(key, info);
+        return info;
+      }
+    } catch {
+      // Ignore TVMaze lookup miss
+    }
+  }
+
   return null;
 }
 
-async function searchSiloOnDemand(cfg, itemType, parsed) {
-  const session = await getValidSession(cfg, false);
-  const providerKey = `${parsed.provider}.${parsed.id}`;
+async function resolveEquivalentIds(parsed, itemType = 'Series') {
+  const incoming = { provider: parsed.provider, id: String(parsed.id) };
+  const cacheKey = `${itemType}:${parsed.provider}:${parsed.id}`;
 
-  const { data: idData, session: activeSession } = await siloGet(
-    cfg,
-    `/Users/${session.userId}/Items`,
-    {
-      Recursive: true,
-      IncludeItemTypes: itemType,
-      AnyProviderIdEquals: providerKey,
-      Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
-      Limit: 25,
-    }
-  );
-
-  const items = (idData?.Items || []).filter((item) =>
-    matchProviderId(item, parsed.provider, parsed.id)
-  );
-
-  if (items.length > 0) {
-    return { matches: [items[0]], session: activeSession, method: 'ProviderId' };
+  if (idMapCache.has(cacheKey)) {
+    return idMapCache.get(cacheKey);
   }
 
-  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
-  const meta = await resolveCinemetaInfo(itemType === 'Movie' ? 'movie' : 'series', baseId);
+  // Always retain the incoming ID first, even if other IDs are missing externally or on Silo
+  const found = new Map([[`${incoming.provider}:${incoming.id}`, incoming]]);
+  const stremioType = itemType === 'Movie' ? 'movie' : 'series';
 
-  if (meta?.name) {
-    const { data: searchData, session: searchSession } = await siloGet(
+  // 1. Check Cinemeta for linked imdb_id when starting with imdb or tmdb
+  if (parsed.provider === 'imdb' || parsed.provider === 'tmdb') {
+    const metaId = parsed.provider === 'imdb' ? parsed.id : `tmdb:${parsed.id}`;
+    try {
+      const res = await axios.get(
+        `https://v3-cinemeta.strem.io/meta/${stremioType}/${encodeURIComponent(metaId)}.json`,
+        { timeout: 5000 }
+      );
+      const imdbId = res.data?.meta?.imdb_id;
+      if (imdbId && String(imdbId).startsWith('tt')) {
+        found.set(`imdb:${imdbId}`, { provider: 'imdb', id: String(imdbId) });
+      }
+    } catch {
+      // Ignore Cinemeta miss; keep whatever IDs we already have
+    }
+  }
+
+  // 2. For series, check TVMaze lookup by imdb or tvdb to recover any linked imdb / tvdb IDs
+  if (itemType === 'Series') {
+    const imdbCandidate = Array.from(found.values()).find((c) => c.provider === 'imdb');
+    const tvdbCandidate = Array.from(found.values()).find((c) => c.provider === 'tvdb');
+
+    try {
+      let show = null;
+      if (imdbCandidate) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?imdb=${encodeURIComponent(imdbCandidate.id)}`,
+          { timeout: 5000 }
+        );
+        show = r.data;
+      } else if (tvdbCandidate) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?thetvdb=${encodeURIComponent(tvdbCandidate.id)}`,
+          { timeout: 5000 }
+        );
+        show = r.data;
+      }
+
+      if (show?.externals) {
+        if (show.externals.imdb) {
+          found.set(`imdb:${show.externals.imdb}`, {
+            provider: 'imdb',
+            id: String(show.externals.imdb),
+          });
+        }
+        if (show.externals.thetvdb) {
+          found.set(`tvdb:${show.externals.thetvdb}`, {
+            provider: 'tvdb',
+            id: String(show.externals.thetvdb),
+          });
+        }
+      }
+    } catch {
+      // Ignore TVMaze miss; partial ID set still works
+    }
+  }
+
+  const list = Array.from(found.values());
+  idMapCache.set(cacheKey, list);
+  return list;
+}
+
+async function searchSiloOnDemand(cfg, itemType, parsed) {
+  if (!['imdb', 'tmdb', 'tvdb'].includes(parsed.provider)) {
+    return {
+      matches: [],
+      session: await getValidSession(cfg, false),
+      method: 'UnsupportedIdType',
+    };
+  }
+
+  const session = await getValidSession(cfg, false);
+  const candidates = await resolveEquivalentIds(parsed, itemType);
+  let activeSession = session;
+
+  // Check every available ID (imdb, tmdb, tvdb) strictly by ID and return as soon as any one matches
+  for (const cand of candidates) {
+    const providerKey = `${cand.provider}.${cand.id}`;
+    const { data: idData, session: nextSession } = await siloGet(
       cfg,
       `/Users/${session.userId}/Items`,
       {
         Recursive: true,
         IncludeItemTypes: itemType,
-        SearchTerm: meta.name,
+        AnyProviderIdEquals: providerKey,
         Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
-        Limit: 25,
+        Limit: 50,
       }
     );
+    activeSession = nextSession;
 
-    const targetNorm = normalizeTitle(meta.name);
-    const candidates = searchData?.Items || [];
-
-    const exactIdMatch = candidates.find((item) =>
-      matchProviderId(item, parsed.provider, parsed.id)
+    const items = (idData?.Items || []).filter((item) =>
+      matchProviderId(item, cand.provider, cand.id)
     );
-    if (exactIdMatch) {
-      return { matches: [exactIdMatch], session: searchSession, method: 'SearchTerm+Id' };
-    }
 
-    const matchedCandidate = candidates.find((item) => {
-      const itemNorm = normalizeTitle(item.Name);
-      return (
-        itemNorm === targetNorm ||
-        itemNorm === `${targetNorm} ca` ||
-        itemNorm.startsWith(`${targetNorm} `)
-      );
-    });
-
-    if (matchedCandidate) {
-      return { matches: [matchedCandidate], session: searchSession, method: `Title(${matchedCandidate.Name})` };
+    if (items.length > 0) {
+      return {
+        matches: [items[0]],
+        session: activeSession,
+        method: `AnyIdMatch(${providerKey})`,
+      };
     }
   }
 
@@ -302,7 +408,9 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
 
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
-  const possibleYears = [...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean))];
+  const possibleYears = [
+    ...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean)),
+  ];
 
   if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
     const targetEpNorm = normalizeTitle(meta.epTitle);
@@ -317,7 +425,12 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
 
       let matched = yearRes.episodes.filter((ep) => {
         const epNorm = normalizeTitle(ep.Name);
-        return targetEpNorm && (epNorm === targetEpNorm || epNorm.includes(targetEpNorm) || targetEpNorm.includes(epNorm));
+        return (
+          targetEpNorm &&
+          (epNorm === targetEpNorm ||
+            epNorm.includes(targetEpNorm) ||
+            targetEpNorm.includes(epNorm))
+        );
       });
 
       if (matched.length === 0 && meta.epReleased) {
@@ -340,8 +453,8 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
 
 function formatBytes(bytes) {
   if (!bytes || Number.isNaN(Number(bytes))) return '';
-  const gb = Number(bytes) / (1024 ** 3);
-  return gb >= 1 ? `${gb.toFixed(2)} GB` : `${(Number(bytes) / (1024 ** 2)).toFixed(0)} MB`;
+  const gb = Number(bytes) / 1024 ** 3;
+  return gb >= 1 ? `${gb.toFixed(2)} GB` : `${(Number(bytes) / 1024 ** 2).toFixed(0)} MB`;
 }
 
 function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
@@ -400,7 +513,7 @@ function getManifest(configured = false) {
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
     types: ['movie', 'series'],
-    idPrefixes: ['tt', 'tmdb:', 'tvdb:', 'anidb:'],
+    idPrefixes: ['tt', 'tmdb:', 'tvdb:'],
     catalogs: [],
     behaviorHints: {
       configurable: true,
@@ -419,7 +532,9 @@ app.get('/manifest.json', (_req, res) => {
 
 app.get('/:config/manifest.json', (req, res) => {
   const cfg = decodeConfig(req.params.config);
-  const isConfigured = Boolean(cfg?.serverUrl && (cfg?.username || (cfg?.userId && cfg?.accessToken)));
+  const isConfigured = Boolean(
+    cfg?.serverUrl && (cfg?.username || (cfg?.userId && cfg?.accessToken))
+  );
   res.json(getManifest(isConfigured));
 });
 

@@ -399,6 +399,17 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
       `[SiloBridge] Query ${providerKey}: raw=${rawItems.length}, matched=${items.length}`
     );
 
+    if (items.length === 0 && rawItems[0]) {
+      console.log(
+        `[SiloBridge] Sample item for ${providerKey}:`,
+        JSON.stringify({
+          Id: rawItems[0].Id,
+          Name: rawItems[0].Name,
+          ProviderIds: rawItems[0].ProviderIds || {},
+        })
+      );
+    }
+
     if (items.length > 0) {
       return {
         matches: [items[0]],

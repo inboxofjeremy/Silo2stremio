@@ -388,7 +388,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
         IncludeItemTypes: itemType,
         AnyProviderIdEquals: providerKey,
         Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
-        Limit: 50,
+        Limit: 500,
       }
     );
     activeSession = nextSession;

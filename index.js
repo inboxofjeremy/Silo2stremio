@@ -619,11 +619,11 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
 async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta = null) {
   const session = await getValidSession(cfg, false);
-  const targetEpNorm = normalizeTitle(meta?.epTitle);
-
-  if (!targetEpNorm && !meta?.epReleased) {
-    return { episodes: [], session };
-  }
+  const candidates = await resolveEquivalentIds(
+    { provider: 'imdb', id: meta?.imdb_id || '' },
+    'Series',
+    cfg
+  ).catch(() => []);
 
   async function fetchSeasonEpisodes(seasonNum) {
     try {
@@ -640,13 +640,13 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
         IncludeItemTypes: 'Episode',
         ParentIndexNumber: seasonNum,
         Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
-        Limit: 100,
+        Limit: 200,
       });
       return { episodes: res.data?.Items || [], session: res.session };
     }
   }
 
-  async function fetchYearLikeSeasons() {
+  async function fetchSeasonNumbers() {
     try {
       const res = await siloGet(cfg, `/Shows/${seriesId}/Seasons`, {
         UserId: session.userId,
@@ -654,57 +654,95 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
       const items = res.data?.Items || [];
       return items
         .map((s) => Number(s.IndexNumber ?? s.Name))
-        .filter((n) => !Number.isNaN(n) && n >= 1950 && n <= 2100);
+        .filter((n) => !Number.isNaN(n));
     } catch {
       return [];
     }
   }
 
+  const metaCandidates = [];
+  if (meta?.epTitle || meta?.epReleased) {
+    metaCandidates.push({
+      season: targetSeason,
+      episode: targetEpisode,
+      epTitle: meta.epTitle || null,
+      epReleased: meta.epReleased || null,
+    });
+  }
+
+  if (targetSeason >= 23 && targetSeason <= 25) {
+    for (const offset of [-1, -2, -3, -4]) {
+      const shiftedSeason = targetSeason + offset;
+      if (shiftedSeason < 1) continue;
+      const shiftedMeta = await resolveEpisodeMetadata(candidates, shiftedSeason, targetEpisode);
+      if (shiftedMeta?.epTitle || shiftedMeta?.epReleased) {
+        metaCandidates.push({
+          season: shiftedSeason,
+          episode: targetEpisode,
+          epTitle: shiftedMeta.epTitle || null,
+          epReleased: shiftedMeta.epReleased || null,
+        });
+      }
+    }
+  }
+
   const currentYear = new Date().getFullYear();
-  const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
-  const siloYearSeasons = await fetchYearLikeSeasons();
+  const siloSeasons = await fetchSeasonNumbers();
   const candidateSeasons = [
     ...new Set(
       [
-        airYear,
         currentYear,
         currentYear - 1,
         currentYear - 2,
         currentYear - 3,
-        currentYear - 4,
-        currentYear - 5,
-        ...siloYearSeasons,
+        ...siloSeasons,
         targetSeason,
       ].filter((y) => typeof y === 'number' && !Number.isNaN(y))
     ),
   ];
 
   let latestSession = session;
+  const allEpisodes = [];
 
   for (let i = 0; i < candidateSeasons.length; i++) {
     if (i > 0) {
-      await sleep(150);
+      await sleep(120);
     }
-    const seasonBucket = candidateSeasons[i];
-    const seasonRes = await fetchSeasonEpisodes(seasonBucket);
-    latestSession = seasonRes.session;
-    if (seasonRes.episodes.length === 0) continue;
+    const bucket = candidateSeasons[i];
+    const res = await fetchSeasonEpisodes(bucket);
+    latestSession = res.session;
+    for (const ep of res.episodes || []) {
+      allEpisodes.push({ ...ep, _bucket: bucket });
+    }
+  }
 
-    let matches = [];
-    if (targetEpNorm) {
-      matches = seasonRes.episodes.filter((ep) => normalizeTitle(ep.Name) === targetEpNorm);
-    }
-    if (matches.length === 0 && meta?.epReleased) {
-      matches = seasonRes.episodes.filter(
-        (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
-      );
-    }
+  for (const cand of metaCandidates) {
+    const targetNorm = normalizeTitle(cand.epTitle);
+    const targetDate = cand.epReleased ? String(cand.epReleased).slice(0, 10) : null;
 
-    if (matches.length > 0) {
+    const scored = allEpisodes
+      .map((ep) => {
+        const epNorm = normalizeTitle(ep.Name);
+        const epDate = ep.PremiereDate ? String(ep.PremiereDate).slice(0, 10) : null;
+        let score = 0;
+
+        if (targetDate && epDate === targetDate) score += 10;
+        if (targetNorm && epNorm === targetNorm) score += 20;
+        else if (targetNorm && epNorm && (epNorm.includes(targetNorm) || targetNorm.includes(epNorm))) {
+          score += 5;
+        }
+
+        return { ep, score };
+      })
+      .filter((entry) => entry.score >= 20 || (targetDate && entry.score >= 10))
+      .sort((a, b) => b.score - a.score);
+
+    if (scored.length > 0) {
+      const best = scored[0].ep;
       console.log(
-        `[SiloBridge] External-meta match: S${targetSeason}E${targetEpisode} -> bucket ${seasonBucket} (${matches.map((e) => e.Name).join(', ')})`
+        `[SiloBridge] Remapped S${targetSeason}E${targetEpisode} (via S${cand.season}E${cand.episode}) -> bucket ${best._bucket} "${best.Name}" (score=${scored[0].score})`
       );
-      return { episodes: matches, session: latestSession };
+      return { episodes: [best], session: latestSession };
     }
   }
 

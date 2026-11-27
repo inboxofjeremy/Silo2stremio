@@ -11,6 +11,7 @@ app.use(express.json());
 // Lightweight session, metadata, ID-map, and short-TTL stream caches
 const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
 const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
+const epMetaCache = new Map(); // key = `${imdbId || ''}|${tvdbId || ''}|${season}|${episode}` -> { epTitle, epReleased }
 const idMapCache = new Map(); // key = `${itemType}:${provider}:${id}` -> Array<{ provider, id }>
 const streamCache = new Map(); // key = `${config}::${type}::${id}` -> { expiresAt, streams }
 const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promise
@@ -18,7 +19,7 @@ const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promi
 const STREAM_CACHE_TTL_MS = 60 * 1000;
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.1"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.2"';
 
 const CONFIGURE_HTML = [
   '<!DOCTYPE html>',
@@ -362,6 +363,74 @@ async function resolveCinemetaInfo(type, baseId, season = null, episode = null) 
   return null;
 }
 
+async function resolveEpisodeMetadata(candidates, targetSeason, targetEpisode) {
+  const imdbCand = candidates.find((c) => c.provider === 'imdb');
+  const tvdbCand = candidates.find((c) => c.provider === 'tvdb');
+  const cacheKey = `${imdbCand?.id || ''}|${tvdbCand?.id || ''}|${targetSeason}|${targetEpisode}`;
+
+  if (epMetaCache.has(cacheKey)) {
+    return epMetaCache.get(cacheKey);
+  }
+
+  let epTitle = null;
+  let epReleased = null;
+
+  // 1. Check Cinemeta using resolved IMDb ID first
+  if (imdbCand?.id) {
+    const cineInfo = await resolveCinemetaInfo(
+      'series',
+      imdbCand.id,
+      targetSeason,
+      targetEpisode
+    );
+    if (cineInfo?.epTitle || cineInfo?.epReleased) {
+      epTitle = cineInfo.epTitle || null;
+      epReleased = cineInfo.epReleased || null;
+    }
+  }
+
+  // 2. Fallback to TVMaze show lookup by IMDb or TVDB ID
+  if (!epTitle && !epReleased && (imdbCand?.id || tvdbCand?.id)) {
+    try {
+      let showData = null;
+      if (imdbCand?.id) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?imdb=${encodeURIComponent(imdbCand.id)}`,
+          { timeout: 6000 }
+        );
+        showData = r.data;
+      } else if (tvdbCand?.id) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?thetvdb=${encodeURIComponent(tvdbCand.id)}`,
+          { timeout: 6000 }
+        );
+        showData = r.data;
+      }
+
+      if (showData?.id) {
+        try {
+          const epRes = await axios.get(
+            `https://api.tvmaze.com/shows/${showData.id}/episodebynumber?season=${Number(targetSeason)}&number=${Number(targetEpisode)}`,
+            { timeout: 6000 }
+          );
+          if (epRes.data) {
+            epTitle = epRes.data.name || null;
+            epReleased = epRes.data.airdate ? String(epRes.data.airdate).slice(0, 10) : null;
+          }
+        } catch {
+          // Episode number may differ across season numbering schemes
+        }
+      }
+    } catch {
+      // Ignore TVMaze metadata miss
+    }
+  }
+
+  const result = { epTitle, epReleased };
+  epMetaCache.set(cacheKey, result);
+  return result;
+}
+
 async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
   const incoming = { provider: parsed.provider, id: String(parsed.id) };
   const cacheKey = `${itemType}:${parsed.provider}:${parsed.id}`;
@@ -575,6 +644,20 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
     }
   }
 
+  async function fetchYearLikeSeasons() {
+    try {
+      const res = await siloGet(cfg, `/Shows/${seriesId}/Seasons`, {
+        UserId: session.userId,
+      });
+      const items = res.data?.Items || [];
+      return items
+        .map((s) => Number(s.IndexNumber ?? s.Name))
+        .filter((n) => !Number.isNaN(n) && n >= 1950 && n <= 2100);
+    } catch {
+      return [];
+    }
+  }
+
   const primary = await fetchSeasonEpisodes(targetSeason);
   const exactMatch = primary.episodes.filter(
     (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
@@ -585,36 +668,56 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
 
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
+  const siloYearSeasons = await fetchYearLikeSeasons();
   const possibleYears = [
     ...new Set(
-      [airYear, currentYear, currentYear - 1, currentYear - 2, currentYear - 3].filter(Boolean)
+      [
+        airYear,
+        currentYear,
+        currentYear - 1,
+        currentYear - 2,
+        currentYear - 3,
+        currentYear - 4,
+        currentYear - 5,
+        ...siloYearSeasons,
+      ].filter((y) => typeof y === 'number' && !Number.isNaN(y))
     ),
   ];
 
-  if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
-    const targetEpNorm = normalizeTitle(meta.epTitle);
+  if (!possibleYears.includes(targetSeason) && possibleYears.length > 0) {
+    const targetEpNorm = normalizeTitle(meta?.epTitle);
 
     for (let i = 0; i < possibleYears.length; i++) {
       if (i > 0) {
-        await sleep(200);
+        await sleep(150);
       }
       const yearSeason = possibleYears[i];
       const yearRes = await fetchSeasonEpisodes(yearSeason);
       if (yearRes.episodes.length === 0) continue;
 
-      let matched = yearRes.episodes.filter((ep) => {
-        const epNorm = normalizeTitle(ep.Name);
-        return (
-          targetEpNorm &&
-          (epNorm === targetEpNorm ||
-            epNorm.includes(targetEpNorm) ||
-            targetEpNorm.includes(epNorm))
-        );
-      });
+      let matched = [];
 
-      if (matched.length === 0 && meta.epReleased) {
+      if (targetEpNorm) {
+        matched = yearRes.episodes.filter((ep) => {
+          const epNorm = normalizeTitle(ep.Name);
+          return (
+            epNorm &&
+            (epNorm === targetEpNorm ||
+              epNorm.includes(targetEpNorm) ||
+              targetEpNorm.includes(epNorm))
+          );
+        });
+      }
+
+      if (matched.length === 0 && meta?.epReleased) {
         matched = yearRes.episodes.filter(
           (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
+        );
+      }
+
+      if (matched.length === 0 && !targetEpNorm && !meta?.epReleased) {
+        matched = yearRes.episodes.filter(
+          (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
         );
       }
 
@@ -687,7 +790,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.4.1',
+    version: '1.4.2',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -793,20 +896,9 @@ async function computeStreams(_config, cfg, type, id) {
   let matches = [];
   let activeSession = session;
 
-  const imdbCand = candidates.find((c) => c.provider === 'imdb');
-  const tvdbCand = candidates.find((c) => c.provider === 'tvdb');
-  const metaBaseId =
-    parsed.provider === 'imdb'
-      ? parsed.id
-      : imdbCand
-        ? imdbCand.id
-        : tvdbCand
-          ? `tvdb:${tvdbCand.id}`
-          : `${parsed.provider}:${parsed.id}`;
-
   const epMeta =
     type === 'series' && parsed.season !== null && parsed.episode !== null
-      ? await resolveCinemetaInfo('series', metaBaseId, parsed.season, parsed.episode)
+      ? await resolveEpisodeMetadata(candidates, parsed.season, parsed.episode)
       : null;
 
   if (type === 'movie') {

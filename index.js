@@ -9,12 +9,12 @@ app.use(cors());
 app.use(express.json());
 
 // Lightweight session, metadata, ID-map, and short-TTL stream caches
-const sessionCache = new Map(); // key = `${serverUrl}::${username}` -> { userId, accessToken }
-const metaCache = new Map(); // key = `${type}:${baseId}:${season}:${episode}` -> { name, year, epTitle, epReleased }
-const epMetaCache = new Map(); // key = `${imdbId || ''}|${tvdbId || ''}|${season}|${episode}` -> { epTitle, epReleased }
-const idMapCache = new Map(); // key = `${itemType}:${provider}:${id}` -> Array<{ provider, id }>
-const streamCache = new Map(); // key = `${config}::${type}::${id}` -> { expiresAt, streams }
-const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promise
+const sessionCache = new Map();
+const metaCache = new Map();
+const epMetaCache = new Map();
+const idMapCache = new Map();
+const streamCache = new Map();
+const inflightLookups = new Map();
 
 const STREAM_CACHE_TTL_MS = 60 * 1000;
 
@@ -455,22 +455,14 @@ async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
           }
         );
         const ext = res.data || {};
-        console.log('[SiloBridge] TMDB external_ids:', {
-          imdb_id: ext.imdb_id,
-          tvdb_id: ext.tvdb_id,
-        });
         if (ext.imdb_id && String(ext.imdb_id).startsWith('tt')) {
           found.set(`imdb:${ext.imdb_id}`, { provider: 'imdb', id: String(ext.imdb_id) });
         }
         if (ext.tvdb_id) {
           found.set(`tvdb:${ext.tvdb_id}`, { provider: 'tvdb', id: String(ext.tvdb_id) });
         }
-      } catch (err) {
-        console.log(
-          '[SiloBridge] TMDB external_ids error:',
-          err.response?.status || err.message,
-          err.response?.data?.status_message || ''
-        );
+      } catch {
+        // Ignore TMDB external_ids lookup failure
       }
     }
   }
@@ -531,7 +523,6 @@ async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
   }
 
   const list = Array.from(found.values());
-  console.log('[SiloBridge] ID candidates:', list.map((c) => `${c.provider}:${c.id}`).join(', '));
   idMapCache.set(cacheKey, list);
   return list;
 }
@@ -581,7 +572,6 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   const title = await resolveSearchTitle(itemType, parsed, candidates);
 
   if (!title) {
-    console.log('[SiloBridge] Could not resolve title for SearchTerm lookup');
     return { matches: [], candidates, session, method: 'None' };
   }
 
@@ -598,19 +588,29 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   );
 
   const rawItems = searchData?.Items || [];
-  const matched = rawItems.filter((item) => Boolean(matchAnyCandidateId(item, candidates)));
+  const providerMatches = rawItems.filter((item) => Boolean(matchAnyCandidateId(item, candidates)));
+  const normTarget = normalizeTitle(title);
+  const titleMatches = providerMatches.filter((item) => {
+    const itemNorm = normalizeTitle(item.Name);
+    return itemNorm && (itemNorm === normTarget || itemNorm.includes(normTarget));
+  });
 
-  console.log(
-    `[SiloBridge] SearchTerm "${title}": raw=${rawItems.length}, idMatched=${matched.length}`
-  );
+  const chosen =
+    titleMatches.length > 0
+      ? titleMatches
+      : providerMatches.length > 0
+        ? providerMatches
+        : [];
 
-  if (matched.length > 0) {
-    const matchedCand = matchAnyCandidateId(matched[0], candidates);
+  if (chosen.length > 0) {
+    const matchedCand = matchAnyCandidateId(chosen[0], candidates);
     return {
-      matches: [matched[0]],
+      matches: [chosen[0]],
       candidates,
       session: activeSession,
-      method: `SearchTerm+IdMatch(${matchedCand.provider}:${matchedCand.id})`,
+      method: matchedCand
+        ? `ExternalId(${matchedCand.provider}:${matchedCand.id})`
+        : `Title(${title})`,
     };
   }
 
@@ -619,6 +619,11 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
 async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta = null) {
   const session = await getValidSession(cfg, false);
+  const targetEpNorm = normalizeTitle(meta?.epTitle);
+
+  if (!targetEpNorm && !meta?.epReleased) {
+    return { episodes: [], session };
+  }
 
   async function fetchSeasonEpisodes(seasonNum) {
     try {
@@ -634,7 +639,6 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
         Recursive: true,
         IncludeItemTypes: 'Episode',
         ParentIndexNumber: seasonNum,
-        IndexNumber: targetEpisode,
         Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
         Limit: 100,
       });
@@ -656,23 +660,10 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
     }
   }
 
-  const primary = await fetchSeasonEpisodes(targetSeason);
-  const exactMatch = primary.episodes.filter(
-    (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
-  );
-  if (exactMatch.length > 0) {
-    return { episodes: exactMatch, session: primary.session };
-  }
-
-  const targetEpNorm = normalizeTitle(meta?.epTitle);
-  if (!targetEpNorm) {
-    return { episodes: [], session };
-  }
-
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
   const siloYearSeasons = await fetchYearLikeSeasons();
-  const possibleYears = [
+  const candidateSeasons = [
     ...new Set(
       [
         airYear,
@@ -683,45 +674,41 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
         currentYear - 4,
         currentYear - 5,
         ...siloYearSeasons,
+        targetSeason,
       ].filter((y) => typeof y === 'number' && !Number.isNaN(y))
     ),
   ];
 
-  if (!possibleYears.includes(targetSeason) && possibleYears.length > 0) {
-    const seenIds = new Set();
-    const collected = [];
-    let latestSession = session;
+  let latestSession = session;
 
-    for (let i = 0; i < possibleYears.length; i++) {
-      if (i > 0) {
-        await sleep(150);
-      }
-      const yearSeason = possibleYears[i];
-      const yearRes = await fetchSeasonEpisodes(yearSeason);
-      latestSession = yearRes.session;
-      if (yearRes.episodes.length === 0) continue;
+  for (let i = 0; i < candidateSeasons.length; i++) {
+    if (i > 0) {
+      await sleep(150);
+    }
+    const seasonBucket = candidateSeasons[i];
+    const seasonRes = await fetchSeasonEpisodes(seasonBucket);
+    latestSession = seasonRes.session;
+    if (seasonRes.episodes.length === 0) continue;
 
-      const exactTitleMatches = yearRes.episodes.filter(
-        (ep) => normalizeTitle(ep.Name) === targetEpNorm
+    let matches = [];
+    if (targetEpNorm) {
+      matches = seasonRes.episodes.filter((ep) => normalizeTitle(ep.Name) === targetEpNorm);
+    }
+    if (matches.length === 0 && meta?.epReleased) {
+      matches = seasonRes.episodes.filter(
+        (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
       );
+    }
 
-      for (const ep of exactTitleMatches) {
-        if (!seenIds.has(ep.Id)) {
-          seenIds.add(ep.Id);
-          collected.push(ep);
-        }
-      }
-
-      if (collected.length > 0) {
-        console.log(
-          `[SiloBridge] Strict title match: S${targetSeason}E${targetEpisode} -> Year ${yearSeason} (${collected.map((e) => `${e.Id}:S${yearSeason}E${e.IndexNumber}`).join(', ')})`
-        );
-        return { episodes: collected, session: latestSession };
-      }
+    if (matches.length > 0) {
+      console.log(
+        `[SiloBridge] External-meta match: S${targetSeason}E${targetEpisode} -> bucket ${seasonBucket} (${matches.map((e) => e.Name).join(', ')})`
+      );
+      return { episodes: matches, session: latestSession };
     }
   }
 
-  return { episodes: [], session };
+  return { episodes: [], session: latestSession };
 }
 
 function formatBytes(bytes) {
@@ -753,7 +740,7 @@ async function buildStreamCards(cfg, item, serverUrl, accessToken, seriesTitle =
         sources = pbRes.data.MediaSources;
       }
     } catch {
-      // Fall back to direct item stream URL without a synthetic MediaSourceId
+      // Fall back to direct item stream URL
     }
   }
 

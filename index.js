@@ -20,6 +20,107 @@ const STREAM_CACHE_TTL_MS = 60 * 1000;
 const EMY_AUTH_HEADER =
   'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.0"';
 
+const CONFIGURE_HTML = [
+  '<!DOCTYPE html>',
+  '<html lang="en">',
+  '<head>',
+  '  <meta charset="UTF-8" />',
+  '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+  '  <title>Silo Server - Stremio & AIOStreams Bridge</title>',
+  '  <style>',
+  '    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e5e7eb; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }',
+  '    .card { background: #181b23; border: 1px solid #2a2f3d; border-radius: 12px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 12px 32px rgba(0,0,0,0.4); }',
+  '    h1 { font-size: 1.35rem; margin: 0 0 6px; color: #fff; }',
+  '    p.sub { font-size: 0.9rem; color: #9ca3af; margin: 0 0 20px; }',
+  '    label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; color: #d1d5db; }',
+  '    input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #0f1117; color: #fff; font-size: 0.95rem; margin-bottom: 14px; }',
+  '    input:focus { outline: none; border-color: #6366f1; }',
+  '    .hint { font-size: 0.78rem; color: #9ca3af; margin: -10px 0 14px; }',
+  '    button { width: 100%; padding: 11px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; background: #6366f1; color: #fff; transition: background 0.15s; }',
+  '    button:hover { background: #4f46e5; }',
+  '    button:disabled { opacity: 0.6; cursor: not-allowed; }',
+  '    .result { margin-top: 18px; padding: 14px; border-radius: 8px; background: #0f1117; border: 1px solid #2a2f3d; display: none; }',
+  '    .result.error { border-color: #ef4444; color: #fca5a5; }',
+  '    .manifest-box { word-break: break-all; font-family: monospace; font-size: 0.82rem; color: #a5b4fc; background: #141720; padding: 10px; border-radius: 6px; margin: 10px 0; }',
+  '    .btn-row { display: flex; gap: 8px; margin-top: 10px; }',
+  '    .btn-secondary { background: #262b38; }',
+  '    .btn-secondary:hover { background: #323848; }',
+  '  </style>',
+  '</head>',
+  '<body>',
+  '  <div class="card">',
+  '    <h1>Silo Server Bridge</h1>',
+  '    <p class="sub">Connect your Silo Server library to Stremio or AIOStreams.</p>',
+  '    <label for="serverUrl">Silo Compatibility Server URL</label>',
+  '    <input id="serverUrl" type="url" placeholder="https://bmsilo1-jf.appboxmanager.xyz" required />',
+  '    <div class="hint">Use your Silo Jellyfin/Emby compatibility URL (no trailing slash).</div>',
+  '    <label for="username">Username</label>',
+  '    <input id="username" type="text" placeholder="Username or Username#ProfileName" required />',
+  '    <div class="hint">Include #ProfileName if you use Silo household profiles.</div>',
+  '    <label for="password">Password</label>',
+  '    <input id="password" type="password" placeholder="Password (or Password#PIN)" />',
+  '    <button id="connectBtn" onclick="connectSilo()">Generate Manifest URL</button>',
+  '    <div id="errorBox" class="result error"></div>',
+  '    <div id="successBox" class="result">',
+  '      <div style="font-size:0.85rem;font-weight:600;color:#34d399;">Connected! Copy this Manifest URL into Stremio or AIOStreams:</div>',
+  '      <div id="manifestUrl" class="manifest-box"></div>',
+  '      <div class="btn-row">',
+  '        <button type="button" class="btn-secondary" onclick="copyManifest()">Copy Manifest URL</button>',
+  '        <button type="button" onclick="installStremio()">Install in Stremio</button>',
+  '      </div>',
+  '    </div>',
+  '  </div>',
+  '  <script>',
+  '    let generatedUrl = "";',
+  '    async function connectSilo() {',
+  '      const btn = document.getElementById("connectBtn");',
+  '      const errorBox = document.getElementById("errorBox");',
+  '      const successBox = document.getElementById("successBox");',
+  '      errorBox.style.display = "none";',
+  '      successBox.style.display = "none";',
+  '      const serverUrl = document.getElementById("serverUrl").value.trim();',
+  '      const username = document.getElementById("username").value.trim();',
+  '      const password = document.getElementById("password").value;',
+  '      if (!serverUrl || !username) {',
+  '        errorBox.textContent = "Please enter both Server URL and Username.";',
+  '        errorBox.style.display = "block";',
+  '        return;',
+  '      }',
+  '      btn.disabled = true;',
+  '      btn.textContent = "Connecting to Silo...";',
+  '      try {',
+  '        const res = await fetch("/api/auth", {',
+  '          method: "POST",',
+  '          headers: { "Content-Type": "application/json" },',
+  '          body: JSON.stringify({ serverUrl, username, password })',
+  '        });',
+  '        const data = await res.json();',
+  '        if (!res.ok) throw new Error(data.error || "Login failed");',
+  '        generatedUrl = window.location.origin + "/" + data.configToken + "/manifest.json";',
+  '        document.getElementById("manifestUrl").textContent = generatedUrl;',
+  '        successBox.style.display = "block";',
+  '      } catch (err) {',
+  '        errorBox.textContent = err.message;',
+  '        errorBox.style.display = "block";',
+  '      } finally {',
+  '        btn.disabled = false;',
+  '        btn.textContent = "Generate Manifest URL";',
+  '      }',
+  '    }',
+  '    function copyManifest() {',
+  '      if (!generatedUrl) return;',
+  '      navigator.clipboard.writeText(generatedUrl);',
+  '      alert("Manifest URL copied!");',
+  '    }',
+  '    function installStremio() {',
+  '      if (!generatedUrl) return;',
+  '      window.location.href = generatedUrl.replace("https://", "stremio://").replace("http://", "stremio://");',
+  '    }',
+  '  </script>',
+  '</body>',
+  '</html>',
+].join('\n');
+
 function encodeConfig(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
@@ -324,4 +425,437 @@ async function resolveEquivalentIds(parsed, itemType = 'Series', cfg = {}) {
   }
 
   if (itemType === 'Series') {
-    const imdbCandidate = Array.from(found.values()).find((c) =>
+    const imdbCandidate = Array.from(found.values()).find((c) => c.provider === 'imdb');
+    const tvdbCandidate = Array.from(found.values()).find((c) => c.provider === 'tvdb');
+
+    try {
+      let show = null;
+      if (imdbCandidate) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?imdb=${encodeURIComponent(imdbCandidate.id)}`,
+          { timeout: 5000 }
+        );
+        show = r.data;
+      } else if (tvdbCandidate) {
+        const r = await axios.get(
+          `https://api.tvmaze.com/lookup/shows?thetvdb=${encodeURIComponent(tvdbCandidate.id)}`,
+          { timeout: 5000 }
+        );
+        show = r.data;
+      }
+
+      if (show?.externals) {
+        if (show.externals.imdb) {
+          found.set(`imdb:${show.externals.imdb}`, {
+            provider: 'imdb',
+            id: String(show.externals.imdb),
+          });
+        }
+        if (show.externals.thetvdb) {
+          found.set(`tvdb:${show.externals.thetvdb}`, {
+            provider: 'tvdb',
+            id: String(show.externals.thetvdb),
+          });
+        }
+      }
+    } catch {
+      // Ignore TVMaze miss
+    }
+  }
+
+  const list = Array.from(found.values());
+  console.log('[SiloBridge] ID candidates:', list.map((c) => `${c.provider}:${c.id}`).join(', '));
+  idMapCache.set(cacheKey, list);
+  return list;
+}
+
+async function resolveSearchTitle(itemType, parsed, candidates) {
+  const stremioType = itemType === 'Movie' ? 'movie' : 'series';
+  const imdbCand = candidates.find((c) => c.provider === 'imdb');
+  const tvdbCand = candidates.find((c) => c.provider === 'tvdb');
+
+  const baseId =
+    parsed.provider === 'imdb'
+      ? parsed.id
+      : imdbCand
+        ? imdbCand.id
+        : `${parsed.provider}:${parsed.id}`;
+
+  const info = await resolveCinemetaInfo(stremioType, baseId, parsed.season, parsed.episode);
+  if (info?.name) return info.name;
+
+  if (itemType === 'Series' && tvdbCand) {
+    try {
+      const r = await axios.get(
+        `https://api.tvmaze.com/lookup/shows?thetvdb=${encodeURIComponent(tvdbCand.id)}`,
+        { timeout: 5000 }
+      );
+      if (r.data?.name) return r.data.name;
+    } catch {
+      // Ignore TVMaze fallback miss
+    }
+  }
+
+  return null;
+}
+
+async function searchSiloOnDemand(cfg, itemType, parsed) {
+  if (!['imdb', 'tmdb', 'tvdb'].includes(parsed.provider)) {
+    return {
+      matches: [],
+      session: await getValidSession(cfg, false),
+      method: 'UnsupportedIdType',
+    };
+  }
+
+  const session = await getValidSession(cfg, false);
+  const candidates = await resolveEquivalentIds(parsed, itemType, cfg);
+  const title = await resolveSearchTitle(itemType, parsed, candidates);
+
+  if (!title) {
+    console.log('[SiloBridge] Could not resolve title for SearchTerm lookup');
+    return { matches: [], session, method: 'None' };
+  }
+
+  const { data: searchData, session: activeSession } = await siloGet(
+    cfg,
+    `/Users/${session.userId}/Items`,
+    {
+      Recursive: true,
+      IncludeItemTypes: itemType,
+      SearchTerm: title,
+      Fields: 'ProviderIds,MediaSources,Path,ProductionYear',
+      Limit: 25,
+    }
+  );
+
+  const rawItems = searchData?.Items || [];
+  const matched = rawItems.filter((item) => Boolean(matchAnyCandidateId(item, candidates)));
+
+  console.log(
+    `[SiloBridge] SearchTerm "${title}": raw=${rawItems.length}, idMatched=${matched.length}`
+  );
+
+  if (matched.length > 0) {
+    const matchedCand = matchAnyCandidateId(matched[0], candidates);
+    return {
+      matches: [matched[0]],
+      session: activeSession,
+      method: `SearchTerm+IdMatch(${matchedCand.provider}:${matchedCand.id})`,
+    };
+  }
+
+  return { matches: [], session: activeSession, method: 'None' };
+}
+
+async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta = null) {
+  const session = await getValidSession(cfg, false);
+
+  async function fetchSeasonEpisodes(seasonNum) {
+    try {
+      const res = await siloGet(cfg, `/Shows/${seriesId}/Episodes`, {
+        UserId: session.userId,
+        Season: seasonNum,
+        Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
+      });
+      return { episodes: res.data?.Items || [], session: res.session };
+    } catch {
+      const res = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+        ParentId: seriesId,
+        Recursive: true,
+        IncludeItemTypes: 'Episode',
+        ParentIndexNumber: seasonNum,
+        IndexNumber: targetEpisode,
+        Fields: 'ProviderIds,MediaSources,Path,PremiereDate',
+        Limit: 100,
+      });
+      return { episodes: res.data?.Items || [], session: res.session };
+    }
+  }
+
+  const primary = await fetchSeasonEpisodes(targetSeason);
+  const exactMatch = primary.episodes.filter(
+    (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
+  );
+  if (exactMatch.length > 0) {
+    return { episodes: exactMatch, session: primary.session };
+  }
+
+  const currentYear = new Date().getFullYear();
+  const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
+  const possibleYears = [
+    ...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean)),
+  ];
+
+  if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
+    const targetEpNorm = normalizeTitle(meta.epTitle);
+
+    for (let i = 0; i < possibleYears.length; i++) {
+      if (i > 0) {
+        await sleep(200);
+      }
+      const yearSeason = possibleYears[i];
+      const yearRes = await fetchSeasonEpisodes(yearSeason);
+      if (yearRes.episodes.length === 0) continue;
+
+      let matched = yearRes.episodes.filter((ep) => {
+        const epNorm = normalizeTitle(ep.Name);
+        return (
+          targetEpNorm &&
+          (epNorm === targetEpNorm ||
+            epNorm.includes(targetEpNorm) ||
+            targetEpNorm.includes(epNorm))
+        );
+      });
+
+      if (matched.length === 0 && meta.epReleased) {
+        matched = yearRes.episodes.filter(
+          (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
+        );
+      }
+
+      if (matched.length > 0) {
+        console.log(
+          `[SiloBridge] Year-season match: S${targetSeason}E${targetEpisode} -> S${yearSeason}E${matched[0].IndexNumber} (${matched[0].Name})`
+        );
+        return { episodes: matched, session: yearRes.session };
+      }
+    }
+  }
+
+  return { episodes: [], session };
+}
+
+function formatBytes(bytes) {
+  if (!bytes || Number.isNaN(Number(bytes))) return '';
+  const gb = Number(bytes) / 1024 ** 3;
+  return gb >= 1 ? `${gb.toFixed(2)} GB` : `${(Number(bytes) / 1024 ** 2).toFixed(0)} MB`;
+}
+
+function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
+  const sources =
+    Array.isArray(item.MediaSources) && item.MediaSources.length > 0
+      ? item.MediaSources
+      : [{ Id: item.Id, Container: 'mp4', MediaStreams: [] }];
+
+  return sources.map((source) => {
+    const streams = source.MediaStreams || [];
+    const video = streams.find((s) => s.Type === 'Video') || {};
+    const audio = streams.find((s) => s.Type === 'Audio') || {};
+
+    let resLabel = 'Direct Play';
+    if (video.Height >= 2100 || video.Width >= 3800) resLabel = '4K';
+    else if (video.Height >= 1000 || video.Width >= 1900) resLabel = '1080p';
+    else if (video.Height >= 700 || video.Width >= 1200) resLabel = '720p';
+    else if (video.Height) resLabel = `${video.Height}p`;
+
+    const videoCodec = video.Codec ? video.Codec.toUpperCase() : '';
+    const audioCodec = audio.Codec ? audio.Codec.toUpperCase() : '';
+    const channels = audio.Channels ? `${audio.Channels}ch` : '';
+    const sizeStr = formatBytes(source.Size);
+
+    const details = [resLabel, videoCodec, audioCodec, channels, sizeStr].filter(Boolean).join(' • ');
+    const displayName = seriesTitle || 'Direct Stream';
+
+    const subtitles = streams
+      .filter((s) => s.Type === 'Subtitle' && s.IsExternal)
+      .map((sub) => ({
+        id: `${source.Id}-${sub.Index}`,
+        lang: sub.Language || 'eng',
+        url: `${serverUrl}/Videos/${item.Id}/${source.Id}/Subtitles/${sub.Index}/Stream.vtt?api_key=${accessToken}`,
+      }));
+
+    const streamUrl = `${serverUrl}/Videos/${item.Id}/stream?static=true&MediaSourceId=${encodeURIComponent(source.Id)}&api_key=${accessToken}`;
+
+    return {
+      name: 'Silo',
+      title: `${displayName}\n${details}`,
+      url: streamUrl,
+      ...(subtitles.length > 0 ? { subtitles } : {}),
+      behaviorHints: {
+        notWebReady: false,
+        bingeGroup: `silo-${resLabel}`,
+      },
+    };
+  });
+}
+
+function getManifest(configured = false) {
+  return {
+    id: 'org.silo.stremio.bridge',
+    version: '1.4.0',
+    name: 'Silo Server',
+    description: 'On-demand direct-play stream resolver for Silo Server',
+    resources: ['stream'],
+    types: ['movie', 'series'],
+    idPrefixes: ['tt', 'tmdb:', 'tvdb:'],
+    catalogs: [],
+    behaviorHints: {
+      configurable: true,
+      configurationRequired: !configured,
+    },
+  };
+}
+
+app.get('/', (_req, res) => {
+  res.redirect('/configure');
+});
+
+app.get('/manifest.json', (_req, res) => {
+  res.json(getManifest(false));
+});
+
+app.get('/:config/manifest.json', (req, res) => {
+  const cfg = decodeConfig(req.params.config);
+  const isConfigured = Boolean(
+    cfg?.serverUrl && (cfg?.username || (cfg?.userId && cfg?.accessToken))
+  );
+  res.json(getManifest(isConfigured));
+});
+
+app.post('/api/auth', async (req, res) => {
+  const { serverUrl, username, password } = req.body || {};
+  if (!serverUrl || !username) {
+    return res.status(400).json({ error: 'Server URL and Username are required.' });
+  }
+
+  try {
+    const baseUrl = serverUrl.replace(/\/+$/, '');
+    const session = await authenticateSilo(baseUrl, username, password || '');
+    const tokenConfig = encodeConfig({
+      serverUrl: baseUrl,
+      username,
+      password: password || '',
+    });
+
+    return res.json({
+      userId: session.userId,
+      configToken: tokenConfig,
+    });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const msg =
+      err.response?.data?.Message ||
+      err.response?.data?.error ||
+      err.message ||
+      'Failed to connect to Silo Server.';
+    return res.status(status).json({ error: msg });
+  }
+});
+
+app.get('/:config/search', async (req, res) => {
+  const cfg = decodeConfig(req.params.config);
+  if (!cfg) return res.status(400).json({ error: 'Invalid config' });
+
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'Provide ?q=search_term' });
+
+  try {
+    const session = await getValidSession(cfg, false);
+    const { data } = await siloGet(cfg, `/Users/${session.userId}/Items`, {
+      Recursive: true,
+      IncludeItemTypes: 'Movie,Series',
+      SearchTerm: q,
+      Fields: 'ProviderIds,MediaSources,ProductionYear',
+      Limit: 25,
+    });
+    const items = (data?.Items || []).map((i) => ({
+      Id: i.Id,
+      Name: i.Name,
+      Type: i.Type,
+      Year: i.ProductionYear,
+      ProviderIds: i.ProviderIds || {},
+    }));
+    return res.json({ query: q, count: items.length, items });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, details: err.response?.data });
+  }
+});
+
+async function computeStreams(_config, cfg, type, id) {
+  const parsed = parseStremioId(id);
+  if (!parsed) {
+    return [];
+  }
+
+  const itemType = type === 'movie' ? 'Movie' : 'Series';
+  const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
+
+  let matches = [];
+  let activeSession = session;
+
+  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
+  const epMeta =
+    type === 'series' && parsed.season !== null && parsed.episode !== null
+      ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
+      : null;
+
+  if (type === 'movie') {
+    matches = foundItems;
+  } else if (type === 'series' && parsed.season !== null && parsed.episode !== null) {
+    for (const series of foundItems) {
+      const epRes = await getSingleEpisode(cfg, series.Id, parsed.season, parsed.episode, epMeta);
+      activeSession = epRes.session;
+      matches.push(...epRes.episodes);
+    }
+  }
+
+  console.log(
+    `[SiloBridge] On-demand ${type} ${id} via [${method}] -> ${matches.length} stream(s)`
+  );
+
+  return matches.flatMap((item) =>
+    buildStreamCards(item, activeSession.serverUrl, activeSession.accessToken, foundItems[0]?.Name)
+  );
+}
+
+app.get('/:config/stream/:type/:id.json', async (req, res) => {
+  const { config, type, id } = req.params;
+  const cfg = decodeConfig(config);
+
+  if (!cfg?.serverUrl || (!cfg?.username && !cfg?.accessToken)) {
+    return res.json({ streams: [] });
+  }
+
+  const cacheKey = `${config}::${type}::${id}`;
+  const now = Date.now();
+  const cached = streamCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return res.json({ streams: cached.streams });
+  }
+
+  if (inflightLookups.has(cacheKey)) {
+    try {
+      const streams = await inflightLookups.get(cacheKey);
+      return res.json({ streams });
+    } catch {
+      return res.json({ streams: [] });
+    }
+  }
+
+  const promise = (async () => {
+    try {
+      const streams = await computeStreams(config, cfg, type, id);
+      streamCache.set(cacheKey, { expiresAt: Date.now() + STREAM_CACHE_TTL_MS, streams });
+      return streams;
+    } catch (err) {
+      console.error('[SiloBridge] Stream lookup failed:', err.response?.status || '', err.message);
+      return [];
+    } finally {
+      inflightLookups.delete(cacheKey);
+    }
+  })();
+
+  inflightLookups.set(cacheKey, promise);
+  const streams = await promise;
+  return res.json({ streams });
+});
+
+app.get(['/configure', '/:config/configure'], (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(CONFIGURE_HTML);
+});
+
+app.listen(PORT, () => {
+  console.log(`Silo Stremio Bridge running on port ${PORT}`);
+});

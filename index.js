@@ -664,6 +664,11 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
     return { episodes: exactMatch, session: primary.session };
   }
 
+  const targetEpNorm = normalizeTitle(meta?.epTitle);
+  if (!targetEpNorm) {
+    return { episodes: [], session };
+  }
+
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
   const siloYearSeasons = await fetchYearLikeSeasons();
@@ -683,7 +688,9 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
   ];
 
   if (!possibleYears.includes(targetSeason) && possibleYears.length > 0) {
-    const targetEpNorm = normalizeTitle(meta?.epTitle);
+    const seenIds = new Set();
+    const collected = [];
+    let latestSession = session;
 
     for (let i = 0; i < possibleYears.length; i++) {
       if (i > 0) {
@@ -691,39 +698,25 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
       }
       const yearSeason = possibleYears[i];
       const yearRes = await fetchSeasonEpisodes(yearSeason);
+      latestSession = yearRes.session;
       if (yearRes.episodes.length === 0) continue;
 
-      let matched = [];
+      const exactTitleMatches = yearRes.episodes.filter(
+        (ep) => normalizeTitle(ep.Name) === targetEpNorm
+      );
 
-      if (targetEpNorm) {
-        matched = yearRes.episodes.filter((ep) => {
-          const epNorm = normalizeTitle(ep.Name);
-          return (
-            epNorm &&
-            (epNorm === targetEpNorm ||
-              epNorm.includes(targetEpNorm) ||
-              targetEpNorm.includes(epNorm))
-          );
-        });
+      for (const ep of exactTitleMatches) {
+        if (!seenIds.has(ep.Id)) {
+          seenIds.add(ep.Id);
+          collected.push(ep);
+        }
       }
 
-      if (matched.length === 0 && meta?.epReleased) {
-        matched = yearRes.episodes.filter(
-          (ep) => ep.PremiereDate && String(ep.PremiereDate).slice(0, 10) === meta.epReleased
-        );
-      }
-
-      if (matched.length === 0 && !targetEpNorm && !meta?.epReleased) {
-        matched = yearRes.episodes.filter(
-          (ep) => Number(ep.IndexNumber) === Number(targetEpisode)
-        );
-      }
-
-      if (matched.length > 0) {
+      if (collected.length > 0) {
         console.log(
-          `[SiloBridge] Year-season match: S${targetSeason}E${targetEpisode} -> S${yearSeason}E${matched[0].IndexNumber} (${matched[0].Name})`
+          `[SiloBridge] Strict title match: S${targetSeason}E${targetEpisode} -> Year ${yearSeason} (${collected.map((e) => `${e.Id}:S${yearSeason}E${e.IndexNumber}`).join(', ')})`
         );
-        return { episodes: matched, session: yearRes.session };
+        return { episodes: collected, session: latestSession };
       }
     }
   }

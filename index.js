@@ -695,6 +695,16 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
       const yearRes = await fetchSeasonEpisodes(yearSeason);
       if (yearRes.episodes.length === 0) continue;
 
+      console.log(
+        `[SiloBridge] Year ${yearSeason} episodes (${yearRes.episodes.length}):`,
+        yearRes.episodes.map((e) => ({
+          Id: e.Id,
+          Idx: e.IndexNumber,
+          Name: e.Name,
+          Date: e.PremiereDate ? String(e.PremiereDate).slice(0, 10) : null,
+        }))
+      );
+
       let matched = [];
 
       if (targetEpNorm) {
@@ -900,6 +910,15 @@ async function computeStreams(_config, cfg, type, id) {
     type === 'series' && parsed.season !== null && parsed.episode !== null
       ? await resolveEpisodeMetadata(candidates, parsed.season, parsed.episode)
       : null;
+
+  if (epMeta) {
+    console.log('[SiloBridge] Resolved epMeta:', {
+      season: parsed.season,
+      episode: parsed.episode,
+      epTitle: epMeta.epTitle,
+      epReleased: epMeta.epReleased,
+    });
+  }
 
   if (type === 'movie') {
     matches = foundItems;

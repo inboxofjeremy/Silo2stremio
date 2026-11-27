@@ -18,7 +18,7 @@ const inflightLookups = new Map(); // key = `${config}::${type}::${id}` -> Promi
 const STREAM_CACHE_TTL_MS = 60 * 1000;
 
 const EMY_AUTH_HEADER =
-  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.0"';
+  'MediaBrowser Client="SiloStremioBridge", Device="Stremio", DeviceId="silo-stremio-bridge-v1", Version="1.4.1"';
 
 const CONFIGURE_HTML = [
   '<!DOCTYPE html>',
@@ -503,6 +503,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
   if (!['imdb', 'tmdb', 'tvdb'].includes(parsed.provider)) {
     return {
       matches: [],
+      candidates: [],
       session: await getValidSession(cfg, false),
       method: 'UnsupportedIdType',
     };
@@ -514,7 +515,7 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
 
   if (!title) {
     console.log('[SiloBridge] Could not resolve title for SearchTerm lookup');
-    return { matches: [], session, method: 'None' };
+    return { matches: [], candidates, session, method: 'None' };
   }
 
   const { data: searchData, session: activeSession } = await siloGet(
@@ -540,12 +541,13 @@ async function searchSiloOnDemand(cfg, itemType, parsed) {
     const matchedCand = matchAnyCandidateId(matched[0], candidates);
     return {
       matches: [matched[0]],
+      candidates,
       session: activeSession,
       method: `SearchTerm+IdMatch(${matchedCand.provider}:${matchedCand.id})`,
     };
   }
 
-  return { matches: [], session: activeSession, method: 'None' };
+  return { matches: [], candidates, session: activeSession, method: 'None' };
 }
 
 async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta = null) {
@@ -584,7 +586,9 @@ async function getSingleEpisode(cfg, seriesId, targetSeason, targetEpisode, meta
   const currentYear = new Date().getFullYear();
   const airYear = meta?.epReleased ? parseInt(meta.epReleased.slice(0, 4), 10) : null;
   const possibleYears = [
-    ...new Set([airYear, currentYear, currentYear - 1, currentYear - 2].filter(Boolean)),
+    ...new Set(
+      [airYear, currentYear, currentYear - 1, currentYear - 2, currentYear - 3].filter(Boolean)
+    ),
   ];
 
   if (!possibleYears.includes(targetSeason) && (meta?.epTitle || meta?.epReleased)) {
@@ -683,7 +687,7 @@ function buildStreamCards(item, serverUrl, accessToken, seriesTitle = '') {
 function getManifest(configured = false) {
   return {
     id: 'org.silo.stremio.bridge',
-    version: '1.4.0',
+    version: '1.4.1',
     name: 'Silo Server',
     description: 'On-demand direct-play stream resolver for Silo Server',
     resources: ['stream'],
@@ -779,15 +783,30 @@ async function computeStreams(_config, cfg, type, id) {
   }
 
   const itemType = type === 'movie' ? 'Movie' : 'Series';
-  const { matches: foundItems, session, method } = await searchSiloOnDemand(cfg, itemType, parsed);
+  const {
+    matches: foundItems,
+    candidates,
+    session,
+    method,
+  } = await searchSiloOnDemand(cfg, itemType, parsed);
 
   let matches = [];
   let activeSession = session;
 
-  const baseId = parsed.provider === 'imdb' ? parsed.id : `${parsed.provider}:${parsed.id}`;
+  const imdbCand = candidates.find((c) => c.provider === 'imdb');
+  const tvdbCand = candidates.find((c) => c.provider === 'tvdb');
+  const metaBaseId =
+    parsed.provider === 'imdb'
+      ? parsed.id
+      : imdbCand
+        ? imdbCand.id
+        : tvdbCand
+          ? `tvdb:${tvdbCand.id}`
+          : `${parsed.provider}:${parsed.id}`;
+
   const epMeta =
     type === 'series' && parsed.season !== null && parsed.episode !== null
-      ? await resolveCinemetaInfo('series', baseId, parsed.season, parsed.episode)
+      ? await resolveCinemetaInfo('series', metaBaseId, parsed.season, parsed.episode)
       : null;
 
   if (type === 'movie') {
